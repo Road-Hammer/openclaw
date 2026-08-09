@@ -3,7 +3,6 @@ import path from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { loadBundledCapabilityRuntimeRegistry } from "./bundled-capability-runtime.js";
 import type { PluginDiscoveryResult } from "./discovery.js";
-import { loadOpenClawPlugins } from "./loader.js";
 import {
   cleanupPluginLoaderFixturesForTest,
   resetPluginLoaderTestStateForTest,
@@ -13,7 +12,6 @@ import {
 import { createEmptyPluginRegistry } from "./registry-empty.js";
 import {
   captureActivePluginRegistrySnapshot,
-  collectLivePluginRegistries,
   getActivePluginRegistry,
   getPluginRegistrationContext,
   listImportedRuntimePluginIds,
@@ -35,45 +33,35 @@ function discoveryFor(...plugins: TempPlugin[]): PluginDiscoveryResult {
   };
 }
 
-function writeArtifactPreferencePlugin(id: string): TempPlugin {
+function writeChannelCapabilityPlugin(id: string): TempPlugin {
   const plugin = writePlugin({
     id,
-    filename: "index.ts",
-    body: `export default {
+    body: `module.exports = {
       id: ${JSON.stringify(id)},
       register(api) {
-        api.registerProvider({ id: ${JSON.stringify(`${id}-source`)}, label: "Source", auth: [] });
+        if (api.registrationMode === "discovery") {
+          api.registerTranscriptSourceProvider({
+            id: ${JSON.stringify(`${id}-voice`)},
+            name: "Voice transcripts",
+            sourceKinds: ["meeting"],
+          });
+        }
       },
     };`,
   });
-  const distDir = path.join(plugin.dir, "dist");
-  fs.mkdirSync(distDir, { recursive: true });
   fs.writeFileSync(
-    path.join(distDir, "index.js"),
-    `module.exports = {
-      id: ${JSON.stringify(id)},
-      register(api) {
-        api.registerProvider({ id: ${JSON.stringify(`${id}-built`)}, label: "Built", auth: [] });
+    path.join(plugin.dir, "openclaw.plugin.json"),
+    JSON.stringify(
+      {
+        id,
+        channels: [id],
+        configSchema: { type: "object", additionalProperties: false, properties: {} },
       },
-    };`,
+      null,
+      2,
+    ),
   );
   return plugin;
-}
-
-function loadCanonicalFixture(plugin: TempPlugin, discovery: PluginDiscoveryResult) {
-  return loadOpenClawPlugins({
-    config: {
-      plugins: {
-        allow: [plugin.id],
-        entries: { [plugin.id]: { enabled: true } },
-      },
-    },
-    discovery,
-    onlyPluginIds: [plugin.id],
-    preferBuiltPluginArtifacts: false,
-    cache: false,
-    activate: false,
-  });
 }
 
 describe("loadBundledCapabilityRuntimeRegistry", () => {
@@ -102,7 +90,6 @@ describe("loadBundledCapabilityRuntimeRegistry", () => {
     const active = createEmptyPluginRegistry();
     setActivePluginRegistry(active, "existing-registry");
     const activeSnapshotBefore = captureActivePluginRegistrySnapshot();
-    const liveRegistriesBefore = collectLivePluginRegistries();
     const registrationContextBefore = getPluginRegistrationContext();
 
     const registry = loadBundledCapabilityRuntimeRegistry({
@@ -115,71 +102,56 @@ describe("loadBundledCapabilityRuntimeRegistry", () => {
     expect(registry.providers.map((entry) => entry.provider.id)).toEqual([target.id]);
     expect(getActivePluginRegistry()).toBe(active);
     expect(captureActivePluginRegistrySnapshot()).toEqual(activeSnapshotBefore);
-    expect(collectLivePluginRegistries()).toEqual(liveRegistriesBefore);
     expect(getPluginRegistrationContext()).toBe(registrationContextBefore);
     expect(listImportedRuntimePluginIds()).toContain(target.id);
   });
 
-  it.each(["source", "built"] as const)(
-    "keeps %s-first artifact preferences isolated across registry snapshots",
-    (firstArtifact) => {
-      const plugin = writeArtifactPreferencePlugin(`capability-${firstArtifact}-first`);
-      const discovery = discoveryFor(plugin);
-      const loadCapability = () =>
-        loadBundledCapabilityRuntimeRegistry({
-          pluginIds: [plugin.id],
-          pluginSdkResolution: "dist",
-          discovery,
-        });
-      const first =
-        firstArtifact === "source" ? loadCanonicalFixture(plugin, discovery) : loadCapability();
-      const second =
-        firstArtifact === "source" ? loadCapability() : loadCanonicalFixture(plugin, discovery);
-
-      expect(first.providers.map((entry) => entry.provider.id)).toEqual([
-        `${plugin.id}-${firstArtifact}`,
-      ]);
-      expect(second.providers.map((entry) => entry.provider.id)).toEqual([
-        `${plugin.id}-${firstArtifact === "source" ? "built" : "source"}`,
-      ]);
-      expect(first.pluginRuntimeArtifacts).not.toBe(second.pluginRuntimeArtifacts);
+  it.each([
+    {
+      name: "explicitly disabled",
+      plugins: { entries: { "blocked-capability": { enabled: false } } },
     },
-  );
-
-  it("loads runtime-backed bundled capabilities through the dist SDK shims", () => {
-    const registry = loadBundledCapabilityRuntimeRegistry({
-      pluginIds: ["codex"],
-      pluginSdkResolution: "dist",
+    { name: "denylisted", plugins: { deny: ["blocked-capability"] } },
+    { name: "outside the restrictive allowlist", plugins: { allow: ["allowed-capability"] } },
+    { name: "blocked by global plugin disablement", plugins: { enabled: false } },
+  ])("never imports a $name plugin through bundled capability capture", ({ plugins }) => {
+    const blocked = writePlugin({
+      id: "blocked-capability",
+      body: `module.exports = {
+        id: "blocked-capability",
+        register(api) {
+          api.registerProvider({ id: "blocked-capability", label: "Blocked", auth: [] });
+        },
+      };`,
     });
 
-    const plugin = registry.plugins.find((entry) => entry.id === "codex");
-    expect(
-      plugin?.status,
-      JSON.stringify({ plugin, diagnostics: registry.diagnostics }, null, 2),
-    ).toBe("loaded");
-    expect(registry.mediaUnderstandingProviders.map((entry) => entry.provider.id)).toEqual([
-      "codex",
-    ]);
-    expect(registry.webSearchProviders.map((entry) => entry.provider.id)).toEqual(["codex"]);
-    expect(registry.migrationProviders.map((entry) => entry.provider.id)).toEqual(["codex"]);
+    const registry = loadBundledCapabilityRuntimeRegistry({
+      pluginIds: [blocked.id],
+      config: { plugins },
+      discovery: discoveryFor(blocked),
+    });
+
+    expect(registry.providers).toEqual([]);
+    expect(listImportedRuntimePluginIds()).not.toContain(blocked.id);
   });
 
-  it("registers Discord voice transcript capabilities without full channel activation", () => {
+  it("registers channel capabilities during discovery without replacing the active registry", () => {
+    const target = writeChannelCapabilityPlugin("capability-channel");
     const active = createEmptyPluginRegistry();
-    setActivePluginRegistry(active, "existing-discord-registry");
+    setActivePluginRegistry(active, "existing-channel-registry");
     const registry = loadBundledCapabilityRuntimeRegistry({
-      pluginIds: ["discord"],
-      pluginSdkResolution: "dist",
+      pluginIds: [target.id],
+      discovery: discoveryFor(target),
     });
 
-    const plugin = registry.plugins.find((entry) => entry.id === "discord");
+    const plugin = registry.plugins.find((entry) => entry.id === target.id);
     expect(
       plugin?.status,
       JSON.stringify({ plugin, diagnostics: registry.diagnostics }, null, 2),
     ).toBe("loaded");
-    expect(plugin?.transcriptSourceProviderIds).toEqual(["discord-voice"]);
+    expect(plugin?.transcriptSourceProviderIds).toEqual([`${target.id}-voice`]);
     expect(registry.transcriptSourceProviders.map((entry) => entry.provider.id)).toEqual([
-      "discord-voice",
+      `${target.id}-voice`,
     ]);
     expect(registry.typedHooks).toEqual([]);
     expect(getActivePluginRegistry()).toBe(active);

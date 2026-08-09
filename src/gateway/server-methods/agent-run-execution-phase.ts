@@ -21,6 +21,7 @@ import {
 } from "../../agents/main-session-recovery-store.js";
 import { resolveScheduledToolPolicyContext } from "../../agents/scheduled-tool-policy.js";
 import { resolveIngressWorkspaceOverrideForSessionRun } from "../../agents/spawned-context.js";
+import { isExecutionIdentityCollectionEnabled } from "../../audit/audit-config.js";
 import {
   setChannelSourceTurnId,
   setChannelSourceTurnSameThreadRequired,
@@ -39,6 +40,7 @@ import {
   buildRunUserTurnIdempotencyKey,
   createUserTurnTranscriptRecorder,
 } from "../../sessions/user-turn-transcript.js";
+import type { AgentTurnContext, AgentTurnIo, AgentTurnPrincipal } from "../agent-turn/types.js";
 import { reactivateCompletedSubagentSession } from "../session-subagent-reactivation.js";
 import { loadSessionEntry } from "../session-utils.js";
 import { formatForLog } from "../ws-log.js";
@@ -51,7 +53,10 @@ import {
   type RestoredCronContinuation,
 } from "./agent-handler-helpers.js";
 import type { AgentRunRequest } from "./agent-request-types.js";
-import { resolveAgentRestartRecoveryChannelContext } from "./agent-restart-recovery-context.js";
+import {
+  resolveAgentRestartRecoveryChannelContext,
+  resolveAgentRestartRecoveryExecutionIdentityAdmission,
+} from "./agent-restart-recovery-context.js";
 import type { PreparedAgentRunDispatch } from "./agent-run-admission-phase.js";
 import {
   resolveAbortedAgentStopReason,
@@ -61,7 +66,6 @@ import { createAgentRunModelSelectionHandler } from "./agent-run-model-selection
 import { resolveSessionRuntimeCwd } from "./agent-session-reset.js";
 import { gatewayClientSenderFields } from "./gateway-client-identity.js";
 import { emitSessionsChanged } from "./session-change-event.js";
-import type { GatewayRequestHandlerOptions } from "./types.js";
 
 export function startAgentRunExecution(params: {
   prepared: PreparedAgentRunDispatch;
@@ -105,9 +109,9 @@ export function startAgentRunExecution(params: {
   restoredCronContinuation?: RestoredCronContinuation;
   canUseInternalRuntimeHandoff: boolean;
   execApprovalFollowupApprovalId?: string;
-  client: GatewayRequestHandlerOptions["client"];
-  context: GatewayRequestHandlerOptions["context"];
-  respond: GatewayRequestHandlerOptions["respond"];
+  client: AgentTurnPrincipal | null;
+  context: AgentTurnContext;
+  io: AgentTurnIo;
   releaseCronContinuationClaimWithRecovery: (
     outcome?: { terminalOutcome: AgentRunTerminalOutcome },
     onRecovered?: () => void,
@@ -138,17 +142,19 @@ export function startAgentRunExecution(params: {
           runId: params.runId,
           stopReason,
         });
-        params.respond(
-          true,
-          {
-            runId: params.runId,
-            status: "timeout" as const,
-            summary: "aborted",
-            stopReason,
-            timeoutPhase: "queue" as const,
-            providerStarted: false,
-          },
-          undefined,
+        params.io.emitFinal(
+          [
+            true,
+            {
+              runId: params.runId,
+              status: "timeout" as const,
+              summary: "aborted",
+              stopReason,
+              timeoutPhase: "queue" as const,
+              providerStarted: false,
+            },
+            undefined,
+          ],
           { runId: params.runId },
         );
         return;
@@ -246,6 +252,9 @@ export function startAgentRunExecution(params: {
           };
         }
       }
+      const senderIsOwner = params.restoredCronContinuation
+        ? true
+        : clientHasAdminScope(params.client);
       const userTurnTranscriptRecorder =
         params.resolvedSessionKey &&
         params.resolvedSessionId &&
@@ -258,6 +267,7 @@ export function startAgentRunExecution(params: {
                 timestamp: Date.now(),
                 idempotencyKey: buildRunUserTurnIdempotencyKey(params.runId),
                 ...gatewayClientSenderFields(params.client),
+                senderIsOwner,
                 ...(params.inputProvenance ? { provenance: params.inputProvenance } : {}),
               },
               target: () => {
@@ -321,6 +331,13 @@ export function startAgentRunExecution(params: {
           params.client.internal.runtimePluginToolGrant?.pluginId
           ? params.client.internal.runtimePluginToolGrant
           : undefined;
+      const executionIdentityAdmission = resolveAgentRestartRecoveryExecutionIdentityAdmission({
+        collectionEnabled: isExecutionIdentityCollectionEnabled(params.cfg),
+        isRestartRecoveryResumeRun: params.isRestartRecoveryResumeRun,
+        retryOnly: params.request.internalExecutionIdentityRetry,
+        runId: params.runId,
+        sessionEntry: params.sessionEntry,
+      });
       const restartRecoveryChannelContext = resolveAgentRestartRecoveryChannelContext({
         canUseInternalRuntimeHandoff: params.canUseInternalRuntimeHandoff,
         expectedExistingSessionId: params.request.expectedExistingSessionId,
@@ -349,6 +366,7 @@ export function startAgentRunExecution(params: {
       );
 
       dispatchAgentRunFromGateway({
+        cronCreatorAuthority: prepared.cronCreatorAuthority,
         ingressOpts: {
           message,
           images: params.images,
@@ -404,9 +422,7 @@ export function startAgentRunExecution(params: {
           acpTurnSource: params.request.acpTurnSource,
           internalEvents: params.request.internalEvents,
           inputProvenance: params.inputProvenance,
-          senderIsOwner: params.restoredCronContinuation
-            ? true
-            : clientHasAdminScope(params.client),
+          senderIsOwner,
           sessionEffects: params.sessionEffects,
           skipInitialSessionTouch: params.skipAgentInitialSessionTouch,
           preserveUserFacingSessionModelState:
@@ -419,6 +435,7 @@ export function startAgentRunExecution(params: {
           swarmOutputSchema: params.request.swarmOutputSchema,
           forceRestartSafeTools: params.request.forceRestartSafeTools,
           forceCodeModeTools: params.request.forceCodeModeTools,
+          ...(executionIdentityAdmission ? { executionIdentityAdmission } : {}),
           internalDeliveryMediaUrls: params.client?.internal?.internalDeliveryMediaUrls,
           internalDeliverySuppressText: params.client?.internal?.internalDeliverySuppressText,
           suppressPromptPersistence:
@@ -431,6 +448,7 @@ export function startAgentRunExecution(params: {
           cleanupBundleMcpOnRunEnd: params.request.cleanupBundleMcpOnRunEnd,
           abortSignal: prepared.activeRunAbort.controller.signal,
           lifecycleGeneration: params.lifecycleGeneration,
+          onExecutionStarted: () => prepared.activeRunAbort.markExecutionStarted(),
           onActiveModelSelected: createAgentRunModelSelectionHandler({
             context: params.context,
             runId: params.runId,
@@ -441,6 +459,7 @@ export function startAgentRunExecution(params: {
             resolvedSessionKey: params.resolvedSessionKey,
             lifecycleStorePath: prepared.lifecycleStorePath,
             activeSessionAgentId: params.activeSessionAgentId,
+            trustedInternalHandoff: prepared.trustedInternalHandoff,
           }),
           onSessionIdChanged: (sessionId) => {
             if (prepared.activeRunAbort.entry) {
@@ -474,7 +493,7 @@ export function startAgentRunExecution(params: {
                 onRecovered,
               )
           : undefined,
-        respond: params.respond,
+        io: params.io,
         context: params.context,
         taskTrackingMode: prepared.dispatchTaskTrackingMode,
         restoreAdmittedRecovery: prepared.restoreAdmittedRestartRecoveryInterrupted,
@@ -496,7 +515,7 @@ export function startAgentRunExecution(params: {
         keys: params.agentDedupeKeys,
         entry: { ts: Date.now(), ok: false, payload, error },
       });
-      params.respond(false, payload, error, {
+      params.io.emitFinal([false, payload, error], {
         runId: params.runId,
         error: formatForLog(err),
       });

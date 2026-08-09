@@ -32,7 +32,8 @@ import { SESSION_DRAG_MIME } from "../../lib/sessions/drag.ts";
 import { sessionNavigationTarget } from "../../lib/sessions/route-navigation.ts";
 import { createStorageMock } from "../../test-helpers/storage.ts";
 import { ChatPage } from "./chat-page.ts";
-import { loadChatRoute } from "./route-loader.ts";
+import { routeDraft } from "./route-draft.ts";
+import { loadChatRoute, type SessionChatRouteData } from "./route-loader.ts";
 
 const WORK_SESSION_KEY = "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdef";
 const SESSION_VIEWERS_SET_METHOD = "sessions.viewers.set";
@@ -50,6 +51,7 @@ import { insertPane, type ChatSplitLayout } from "./split-layout.ts";
 
 type RenderedPane = HTMLElement & {
   paneId: string;
+  focusComposer: boolean;
   chatMessagesBySession: ChatMessageCache;
   sessionKey: string;
   active: boolean;
@@ -100,11 +102,11 @@ function setNarrow(page: ChatPage, narrow: boolean) {
 }
 
 function getRouteDraftForActivePane(page: ChatPage): string | undefined {
-  return (
-    page as unknown as {
-      routeDraftForActivePane: () => string | undefined;
-    }
-  ).routeDraftForActivePane();
+  const state = page as unknown as {
+    data: SessionChatRouteData;
+    consumedDraftData: SessionChatRouteData | null;
+  };
+  return routeDraft(state.data, state.consumedDraftData);
 }
 
 function applySessionDrop(page: ChatPage, sessionKey: string, paneId: string, zone: SplitDropZone) {
@@ -139,6 +141,12 @@ function setNavigationContext(page: ChatPage) {
   const setAgent = vi.fn((agentId: string) => {
     agentSelectionState.selectedId = agentId;
   });
+  const browserAnnotationHandoff = {
+    prepare: vi.fn(),
+    consume: vi.fn(() => null),
+    clearPane: vi.fn(),
+    dispose: vi.fn(),
+  };
   const context = {
     basePath: "",
     sessions: { state: { result: null }, subscribe: () => () => undefined, patch },
@@ -147,9 +155,10 @@ function setNavigationContext(page: ChatPage) {
     navigate,
     replace,
     agentSelection: { state: agentSelectionState, set: setAgent },
+    browserAnnotationHandoff,
   } as unknown as ApplicationContext;
   (page as unknown as { context: ApplicationContext }).context = context;
-  return { context, navigate, replace, setAgent, patch };
+  return { browserAnnotationHandoff, context, navigate, replace, setAgent, patch };
 }
 
 function setViewerPresenceContext(page: ChatPage) {
@@ -257,6 +266,62 @@ describe("chat page split layout host", () => {
     expect(typeof itemAt(panes, 0, "rendered pane").onOpenSplitView).toBe("function");
   });
 
+  it("hands route-owned focus to the final page across pane replacement", async () => {
+    const sourcePage = new ChatPage();
+    setNavigationContext(sourcePage);
+    sourcePage.data = {
+      sessionKey: "main",
+      draft: "What can you do?",
+      focusComposer: true,
+    };
+    const page = new ChatPage();
+    setNavigationContext(page);
+    page.data = { sessionKey: "main" };
+
+    vi.useFakeTimers();
+    try {
+      document.body.append(sourcePage);
+      await sourcePage.updateComplete;
+      await Promise.resolve();
+
+      document.body.append(page);
+      await page.updateComplete;
+      const pane = itemAt(page.querySelectorAll<RenderedPane>("openclaw-chat-pane"), 0, "pane");
+      expect(pane.focusComposer).toBe(true);
+
+      const combobox = document.createElement("div");
+      combobox.className = "agent-chat__composer-combobox";
+      const textarea = document.createElement("textarea");
+      combobox.append(textarea);
+      pane.append(combobox);
+      vi.advanceTimersByTime(250);
+      expect(document.activeElement).toBe(textarea);
+
+      const replacementPane = document.createElement("openclaw-chat-pane") as RenderedPane;
+      replacementPane.active = true;
+      replacementPane.sessionKey = "main";
+      const replacementCombobox = document.createElement("div");
+      replacementCombobox.className = "agent-chat__composer-combobox";
+      const replacementTextarea = document.createElement("textarea");
+      replacementCombobox.append(replacementTextarea);
+      replacementPane.append(replacementCombobox);
+      pane.replaceWith(replacementPane);
+
+      vi.advanceTimersByTime(250);
+      expect(document.activeElement).toBe(replacementTextarea);
+
+      const userTarget = document.createElement("button");
+      document.body.append(userTarget);
+      userTarget.focus();
+      vi.advanceTimersByTime(250);
+      expect(document.activeElement).toBe(userTarget);
+    } finally {
+      sourcePage.remove();
+      page.remove();
+      vi.useRealTimers();
+    }
+  });
+
   it("passes the chat-owned gateway capability only to the rightmost pane", async () => {
     const gatewaySnapshot: NativeGatewaysSnapshot = {
       gateways: [],
@@ -299,6 +364,7 @@ describe("chat page split layout host", () => {
 
   it("retains the classic pane element while split view opens and closes", async () => {
     const page = new ChatPage();
+    setNavigationContext(page);
     page.data = { sessionKey: "main" };
     document.body.append(page);
     await page.updateComplete;
@@ -787,7 +853,7 @@ describe("chat page split layout host", () => {
 
     const paneTitles = () =>
       [...page.querySelectorAll<RenderedPane>("openclaw-chat-pane")].map((pane) => pane.paneTitle);
-    expect(paneTitles()).toEqual(["Main Thread", "Main Thread"]);
+    expect(paneTitles()).toEqual(["Main Session", "Main Session"]);
 
     // Rows arrive under the canonical agent key while the route still says
     // "main"; hello-default resolution plus equivalence matching must find

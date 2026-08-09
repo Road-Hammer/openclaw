@@ -14,7 +14,7 @@ import {
   prepareBundledAiRuntimePackage,
   runCommandForTest,
   writePackageInventoryForDocker,
-} from "../../../../scripts/package-openclaw-for-docker.mjs";
+} from "../../../../scripts/package-openclaw-for-docker.mts";
 import { useAutoCleanupTempDirTracker } from "../../../helpers/temp-dir.js";
 
 const skipBundledAiRuntime = async (): Promise<() => Promise<void>> => async () => {};
@@ -23,6 +23,7 @@ const skipDocsMapLifecycle = {
   restoreDocsMap: async (): Promise<void> => {},
 };
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const tsxImport = import.meta.resolve("tsx");
 
 function isProcessAlive(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) {
@@ -231,17 +232,20 @@ describe("package-openclaw-for-docker", () => {
   it("loads from a trusted harness checkout without installed dependencies", async () => {
     const tempRoot = tempDirs.make("openclaw-package-harness-");
     const copiedFiles = [
-      "scripts/package-openclaw-for-docker.mjs",
+      "scripts/package-openclaw-for-docker.mts",
       "scripts/package-changelog.mjs",
       "scripts/package-docs-map.mjs",
       "scripts/docs-list.js",
-      "scripts/npm-runner.mjs",
-      "scripts/pnpm-runner.mjs",
+      "scripts/npm-runner.mts",
+      "scripts/pnpm-runner.mts",
       "scripts/windows-cmd-helpers.mjs",
       "scripts/lib/bundled-plugin-build-entries.mjs",
       "scripts/lib/bundled-plugin-paths.mjs",
-      "scripts/lib/managed-child-process.mjs",
+      "scripts/lib/managed-child-process.mts",
+      "scripts/lib/npm-json-output.mts",
       "scripts/lib/optional-bundled-clusters.mjs",
+      "scripts/lib/record-shared.mjs",
+      "scripts/lib/windows-cmd-helpers-runtime.mts",
       "scripts/lib/windows-taskkill.mjs",
     ];
     try {
@@ -254,7 +258,12 @@ describe("package-openclaw-for-docker", () => {
         (resolve, reject) => {
           const child = spawn(
             process.execPath,
-            [path.join(tempRoot, "scripts/package-openclaw-for-docker.mjs"), "--invalid"],
+            [
+              "--import",
+              tsxImport,
+              path.join(tempRoot, "scripts/package-openclaw-for-docker.mts"),
+              "--invalid",
+            ],
             { cwd: tempRoot, stdio: ["ignore", "ignore", "pipe"] },
           );
           let stderr = "";
@@ -345,7 +354,7 @@ describe("package-openclaw-for-docker", () => {
     );
   });
 
-  it("uses build-all with declaration generation for package artifacts", async () => {
+  it("uses the source package build entrypoint with declaration generation", async () => {
     const calls: Array<{
       command: string;
       args: string[];
@@ -420,8 +429,8 @@ describe("package-openclaw-for-docker", () => {
 
     expect(calls).toEqual([
       {
-        command: "node",
-        args: ["scripts/build-all.mjs", "full"],
+        command: "pnpm",
+        args: ["run", "build"],
         cwd: "/repo",
         dockerBuildExtensions: undefined,
         internalDockerBuildPluginIds: undefined,
@@ -794,7 +803,7 @@ describe("package-openclaw-for-docker", () => {
     }
   });
 
-  it("writes npm pack metadata for renamed package artifacts", async () => {
+  it("normalizes npm 12 pack metadata for renamed package artifacts", async () => {
     const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-docker-pack-json-"));
     const packJsonPath = path.join(outputDir, "pack.json");
 
@@ -823,15 +832,15 @@ describe("package-openclaw-for-docker", () => {
           ]);
           expect(options.deferForwardedSignalExit).toBe(true);
           fs.writeFileSync(path.join(outputDir, "openclaw-2026.5.28.tgz"), "package");
-          return JSON.stringify([
-            {
+          return JSON.stringify({
+            openclaw: {
               entryCount: 1,
               filename: "openclaw-2026.5.28.tgz",
               size: 7,
               unpackedSize: 7,
               version: "2026.5.28",
             },
-          ]);
+          });
         },
       });
 
@@ -1144,7 +1153,7 @@ describe("package-openclaw-for-docker", () => {
 
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-package-signal-"));
     const childPidPath = path.join(tempDir, "child.pid");
-    const scriptUrl = pathToFileURL(path.resolve("scripts/package-openclaw-for-docker.mjs")).href;
+    const scriptUrl = pathToFileURL(path.resolve("scripts/package-openclaw-for-docker.mts")).href;
     let childPid = 0;
     let runnerPid;
     try {

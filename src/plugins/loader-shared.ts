@@ -1,9 +1,11 @@
-import fs from "node:fs";
-import path from "node:path";
 import { err as resultError, ok, type Result } from "@openclaw/normalization-core/result";
-import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { activateContextEngineRegistrations } from "../context-engine/registry.js";
+import { resolveRealpathOrAbsolute } from "../infra/boundary-path.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import {
   DEFAULT_MEMORY_DREAMING_PLUGIN_ID,
@@ -285,7 +287,9 @@ export function createManifestPluginRecord(params: {
     description: manifestRecord.description,
     packageVersion: manifestRecord.packageVersion,
     version: manifestRecord.version,
-    builtWithOpenClawVersion: candidate.packageManifest?.build?.openclawVersion?.trim(),
+    builtWithOpenClawVersion: normalizeOptionalString(
+      candidate.packageManifest?.build?.openclawVersion,
+    ),
     packageName: manifestRecord.packageName,
     format: manifestRecord.format,
     bundleFormat: manifestRecord.bundleFormat,
@@ -366,9 +370,5 @@ export function activatePluginRegistry(
 }
 
 export function safeRealpathOrResolve(value: string): string {
-  try {
-    return fs.realpathSync(value);
-  } catch {
-    return path.resolve(value);
-  }
+  return resolveRealpathOrAbsolute(value);
 }

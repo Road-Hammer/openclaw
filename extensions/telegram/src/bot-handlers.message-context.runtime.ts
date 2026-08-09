@@ -11,17 +11,22 @@ import type {
 } from "./bot-message-context.types.js";
 import type { RegisterTelegramHandlerParams } from "./bot-native-commands.js";
 import type { TelegramContext } from "./bot/types.js";
+import { resolveTelegramDmHistoryLimit } from "./dm-history.js";
 import {
   buildTelegramSelfSenderName,
   isTelegramHistoryEntryAfterAmbientWatermark,
   isTelegramSelfSenderName,
 } from "./group-history-window.js";
 import {
+  resolveTelegramMessageCacheScope,
+  type TelegramResolvedMedia,
+} from "./message-cache-persistence.js";
+import {
   buildTelegramConversationContext,
   buildTelegramReplyChain,
   createTelegramMessageCache,
   isTelegramMessageFromCurrentBot,
-  resolveTelegramMessageCacheScope,
+  resolveProviderObservedTelegramThreadId,
   type TelegramCachedMessageNode,
   type TelegramReplyChainEntry,
 } from "./message-cache.js";
@@ -91,6 +96,58 @@ export function createTelegramMessageContextRuntime({
       ...(threadId != null ? { threadId } : {}),
     });
 
+  const recordMessageResolvedMedia = (params: {
+    msg: Message;
+    media: TelegramResolvedMedia;
+    botUserId?: number;
+  }) =>
+    messageCache.recordResolvedMedia({
+      accountId,
+      chatId: params.msg.chat.id,
+      messageId: String(params.msg.message_id),
+      media: params.media,
+      ...(params.botUserId !== undefined ? { botUserId: params.botUserId } : {}),
+    });
+
+  const recordReplyMessageResolvedMedia = async (params: {
+    chatId: string | number;
+    messageId: string;
+    media: TelegramResolvedMedia;
+    botUserId?: number;
+  }) => {
+    const cachedNode = await messageCache.get({
+      accountId,
+      chatId: params.chatId,
+      messageId: params.messageId,
+    });
+    if (!cachedNode) {
+      return;
+    }
+    await messageCache.recordResolvedMedia({
+      accountId,
+      chatId: params.chatId,
+      messageId: params.messageId,
+      media: params.media,
+      ...(params.botUserId !== undefined ? { botUserId: params.botUserId } : {}),
+    });
+  };
+
+  // `MessageReactionUpdated` carries no `message_thread_id`, so the reaction handler
+  // recovers the originating topic from the same bounded cache that records inbound
+  // and outbound messages. `undefined` means "thread unknown", never "General": the
+  // caller must not substitute a topic id.
+  const resolveCachedMessageThreadId = async (params: {
+    chatId: number | string;
+    messageId: number | string;
+  }): Promise<number | undefined> => {
+    const node = await messageCache.get({
+      accountId,
+      chatId: params.chatId,
+      messageId: String(params.messageId),
+    });
+    return resolveProviderObservedTelegramThreadId(node);
+  };
+
   const buildReplyChainForMessage = (msg: Message) =>
     buildTelegramReplyChain({ cache: messageCache, accountId, chatId: msg.chat.id, msg });
 
@@ -101,6 +158,7 @@ export function createTelegramMessageContextRuntime({
   ): TelegramReplyChainEntry => {
     const {
       sourceMessage: _sourceMessage,
+      resolvedMedia: _resolvedMedia,
       promptContextProjectionMarker: _promptContextProjectionMarker,
       threadBinding: _threadBinding,
       ...entry
@@ -155,6 +213,10 @@ export function createTelegramMessageContextRuntime({
         runtimeCfg.messages?.groupChat?.historyLimit ??
         DEFAULT_GROUP_HISTORY_LIMIT,
     );
+    const dmHistoryLimit = resolveTelegramDmHistoryLimit({
+      config: runtimeTelegramCfg,
+      senderId: msg.from?.id,
+    });
     const messageId = typeof msg.message_id === "number" ? String(msg.message_id) : undefined;
     const currentNode = await messageCache.get({ accountId, chatId: msg.chat.id, messageId });
     const threadId = currentNode?.threadId ? Number(currentNode.threadId) : undefined;
@@ -168,8 +230,8 @@ export function createTelegramMessageContextRuntime({
             chatId: msg.chat.id,
             ...(Number.isFinite(threadId) ? { threadId } : {}),
             replyChainNodes,
-            recentLimit: isGroup ? groupHistoryLimit : 10,
-            replyTargetWindowSize: 2,
+            recentLimit: isGroup ? groupHistoryLimit : dmHistoryLimit,
+            replyTargetWindowSize: isGroup || dmHistoryLimit > 0 ? 2 : 0,
             ...(options?.promptContextMinTimestampMs !== undefined
               ? { minTimestampMs: options.promptContextMinTimestampMs }
               : {}),
@@ -250,6 +312,9 @@ export function createTelegramMessageContextRuntime({
 
   return {
     recordMessageForReplyChain,
+    recordMessageResolvedMedia,
+    recordReplyMessageResolvedMedia,
+    resolveCachedMessageThreadId,
     buildReplyChainForMessage,
     toReplyChainEntry,
     buildPromptContextForMessage,

@@ -12,6 +12,7 @@ import {
   appendTranscriptMessageSync,
   listSessionChildEntriesReadOnly,
   listSessionEntriesReadOnly,
+  recordInboundSessionMeta,
   replaceSessionEntry,
 } from "../config/sessions/session-accessor.js";
 import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
@@ -41,7 +42,6 @@ import {
   resolveGatewayModelSupportsImages,
   resolveGatewaySessionStoreTarget,
   resolveGatewaySessionStoreTargetWithStore,
-  resolveSessionDisplayModelIdentityRef,
   resolveSessionModelRef,
   resolveSessionStoreKey,
 } from "./session-utils.js";
@@ -1103,6 +1103,7 @@ describe("gateway session utils", () => {
         updatedAt: 1,
         totalTokens: 0,
         totalTokensFresh: true,
+        totalTokensVersion: 1,
       },
     });
 
@@ -1148,6 +1149,113 @@ describe("gateway session utils", () => {
       });
 
       expect(row.totalTokens).toBe(40);
+    });
+  });
+
+  test("SQLite unavailable context blocks old totals until a later valid snapshot", async () => {
+    await withStateDirEnv("session-utils-unavailable-usage-", async ({ stateDir }) => {
+      const sessionId = "unavailable-usage";
+      const sessionKey = "agent:main:main";
+      const storePath = path.join(stateDir, "agents", "main", "sessions", "sessions.json");
+      const entry: SessionEntry = {
+        sessionId,
+        updatedAt: 1,
+        totalTokens: 1_124_767,
+        totalTokensFresh: false,
+      };
+      await seedSessionEntries(storePath, { [sessionKey]: entry });
+      appendTranscriptMessages({
+        sessionId,
+        sessionKey,
+        storePath,
+        messages: [
+          {
+            role: "assistant",
+            api: "cli",
+            content: "old cumulative turn",
+            usage: {
+              input: 128_814,
+              output: 3_000,
+              cacheRead: 992_953,
+              totalTokens: 1_124_767,
+            },
+          },
+        ],
+      });
+
+      const legacyRow = buildGatewaySessionRow({
+        cfg: createModelDefaultsConfig({ primary: "anthropic/claude-opus-4-7" }),
+        storePath,
+        store: { [sessionKey]: entry },
+        key: sessionKey,
+        entry,
+      });
+      expect(legacyRow.totalTokens).toBeUndefined();
+      expect(legacyRow.totalTokensFresh).toBe(false);
+
+      appendTranscriptMessages({
+        sessionId,
+        sessionKey,
+        storePath,
+        messages: [
+          {
+            role: "assistant",
+            api: "cli",
+            content: "usage unavailable",
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              contextUsage: { state: "unavailable" },
+            },
+          },
+        ],
+      });
+
+      const unavailableRow = buildGatewaySessionRow({
+        cfg: createModelDefaultsConfig({ primary: "anthropic/claude-opus-4-7" }),
+        storePath,
+        store: { [sessionKey]: entry },
+        key: sessionKey,
+        entry,
+      });
+      expect(unavailableRow.totalTokens).toBeUndefined();
+      expect(unavailableRow.totalTokensFresh).toBe(false);
+
+      appendTranscriptMessages({
+        sessionId,
+        sessionKey,
+        storePath,
+        messages: [
+          {
+            role: "assistant",
+            api: "cli",
+            content: "valid later turn",
+            usage: {
+              input: 67_932,
+              output: 2_000,
+              cacheRead: 18_944,
+              totalTokens: 88_876,
+              contextUsage: {
+                state: "available",
+                promptTokens: 86_876,
+                totalTokens: 88_876,
+              },
+            },
+          },
+        ],
+      });
+      const validRow = buildGatewaySessionRow({
+        cfg: createModelDefaultsConfig({ primary: "anthropic/claude-opus-4-7" }),
+        storePath,
+        store: { [sessionKey]: entry },
+        key: sessionKey,
+        entry,
+      });
+      expect(validRow.totalTokens).toBe(86_876);
+      expect(validRow.totalTokensFresh).toBe(true);
     });
   });
 
@@ -1304,6 +1412,123 @@ describe("gateway session utils", () => {
     expect(row.displayName).toBe("Engineering");
   });
 
+  test("refreshes a legacy Buzz UUID title from inbound room metadata", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-buzz-session-title-"));
+    const storePath = path.join(dir, "sessions.json");
+    const roomId = "b25b8e40-eb1a-43a4-b56b-30a4e16df586";
+    const key = `agent:main:buzz:group:${roomId}`;
+    try {
+      await replaceSessionEntry(
+        { sessionKey: key, storePath },
+        {
+          sessionId: "legacy-buzz-room",
+          updatedAt: 1,
+          chatType: "group",
+          groupId: roomId,
+          groupChannel: roomId,
+          displayName: "buzz:g-b25b8e40-eb1a-43a4-b56b-30a4e16df586",
+        },
+      );
+
+      const entry = await recordInboundSessionMeta({
+        storePath,
+        sessionKey: key,
+        ctx: {
+          Provider: "buzz",
+          Surface: "buzz",
+          ChatType: "group",
+          From: `buzz:group:${roomId}`,
+          To: `buzz:${roomId}`,
+          OriginatingTo: `buzz:${roomId}`,
+          NativeChannelId: roomId,
+          GroupSubject: "Engineering",
+        },
+      });
+
+      expect(entry).toMatchObject({
+        groupId: roomId,
+        subject: "Engineering",
+      });
+      expect(entry?.groupChannel).toBeUndefined();
+      const row = buildGatewaySessionRow({
+        cfg: { agents: { list: [{ id: "main", default: true }] } } as OpenClawConfig,
+        storePath,
+        store: { [key]: entry as SessionEntry },
+        key,
+        entry: entry as SessionEntry,
+      });
+      expect(row.displayName).toBe("Engineering");
+      expect(row.origin?.nativeChannelId).toBe(roomId);
+    } finally {
+      closeSessionSqliteDatabasesForTest();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    {
+      name: "resolved human names",
+      subject: "Local Claw #channel-name",
+    },
+    {
+      name: "explicit stable-id fallback",
+      subject: "Slack Channel (Workspace ID: T0BDK6HMPS7, Channel ID: C0BDN50FL2Z)",
+    },
+  ])("refreshes a legacy Slack id title with $name", async ({ subject }) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-slack-session-title-"));
+    const storePath = path.join(dir, "sessions.json");
+    const channelId = "C0BDN50FL2Z";
+    const key = `agent:main:slack:channel:${channelId.toLowerCase()}`;
+    try {
+      await replaceSessionEntry(
+        { sessionKey: key, storePath },
+        {
+          sessionId: "legacy-slack-channel",
+          updatedAt: 1,
+          chatType: "channel",
+          groupId: channelId.toLowerCase(),
+          groupChannel: `#${channelId}`,
+          space: "T0BDK6HMPS7",
+          displayName: `slack:#${channelId}`,
+        },
+      );
+
+      const entry = await recordInboundSessionMeta({
+        storePath,
+        sessionKey: key,
+        ctx: {
+          Provider: "slack",
+          Surface: "slack",
+          ChatType: "channel",
+          From: `slack:channel:${channelId}`,
+          To: `channel:${channelId}`,
+          OriginatingTo: `channel:${channelId}`,
+          NativeChannelId: channelId,
+          GroupSubject: subject,
+          GroupSpace: "T0BDK6HMPS7",
+        },
+      });
+
+      expect(entry).toMatchObject({
+        groupId: channelId.toLowerCase(),
+        subject,
+      });
+      expect(entry?.groupChannel).toBeUndefined();
+      const row = buildGatewaySessionRow({
+        cfg: { agents: { list: [{ id: "main", default: true }] } } as OpenClawConfig,
+        storePath,
+        store: { [key]: entry as SessionEntry },
+        key,
+        entry: entry as SessionEntry,
+      });
+      expect(row.displayName).toBe(subject);
+      expect(row.origin?.nativeChannelId).toBe(channelId);
+    } finally {
+      closeSessionSqliteDatabasesForTest();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("buildGatewaySessionRow group displayName prefers #channel and falls back to the token", () => {
     const cfg = { agents: { list: [{ id: "main", default: true }] } } as OpenClawConfig;
     const channelEntry: SessionEntry = {
@@ -1347,6 +1572,51 @@ describe("gateway session utils", () => {
       entry: opaque,
     });
     expect(opaqueRow.displayName).toMatch(/^telegram:/);
+  });
+
+  test("buildGatewaySessionRow projects flat classification facts without group tokens", () => {
+    const cfg = { agents: { list: [{ id: "main", default: true }] } } as OpenClawConfig;
+    const subagentEntry = {
+      displayName: "Research",
+    } as SessionEntry;
+    const subagentRow = buildGatewaySessionRow({
+      cfg,
+      storePath: "",
+      store: { "agent:main:subagent:one": subagentEntry },
+      key: "agent:main:subagent:one",
+      entry: subagentEntry,
+    });
+    expect(subagentRow).toMatchObject({
+      classification: "subagent",
+      agentId: "main",
+      isBackground: true,
+    });
+
+    const groupEntry = {
+      chatType: "group",
+      displayName: "telegram:g-private-token",
+    } as SessionEntry;
+    const groupRow = buildGatewaySessionRow({
+      cfg,
+      storePath: "",
+      store: { "agent:main:telegram:group:99": groupEntry },
+      key: "agent:main:telegram:group:99",
+      entry: groupEntry,
+    });
+    expect(groupRow).toMatchObject({
+      classification: "group",
+      peerKind: "group",
+    });
+    expect(
+      JSON.stringify({
+        classification: groupRow.classification,
+        agentId: groupRow.agentId,
+        accountId: groupRow.accountId,
+        peerKind: groupRow.peerKind,
+        isMain: groupRow.isMain,
+        isBackground: groupRow.isBackground,
+      }),
+    ).not.toContain("private-token");
   });
 
   test("buildGatewaySessionRow projects worktree and execNode bindings", () => {
@@ -2800,6 +3070,7 @@ describe("listSessionsFromStore selected model display", () => {
           model: "gpt-5.4",
           totalTokens: 1,
           totalTokensFresh: true,
+          totalTokensVersion: 1,
           contextTokens: 1,
           estimatedCostUsd: 0,
         } as SessionEntry;
@@ -3157,43 +3428,6 @@ describe("listSessionsFromStore selected model display", () => {
   });
 });
 
-describe("resolveSessionDisplayModelIdentityRef", () => {
-  test("canonicalizes CLI runtime provider to the selected model provider", () => {
-    const cfg = createModelDefaultsConfig({
-      primary: "anthropic/claude-opus-4-7",
-      agentRuntime: { id: "claude-cli" },
-    });
-
-    expect(
-      resolveSessionDisplayModelIdentityRef({
-        cfg,
-        agentId: "main",
-        provider: "claude-cli",
-        model: "claude-opus-4-7",
-      }),
-    ).toEqual({ provider: "anthropic", model: "claude-opus-4-7" });
-  });
-
-  test("prefers configured provider inference over default-provider parsing for bare CLI models", () => {
-    const cfg = createModelDefaultsConfig({
-      primary: "openai/gpt-5.4",
-      models: {
-        "anthropic/claude-opus-4-7": {},
-      },
-      agentRuntime: { id: "claude-cli" },
-    });
-
-    expect(
-      resolveSessionDisplayModelIdentityRef({
-        cfg,
-        agentId: "main",
-        provider: "claude-cli",
-        model: "claude-opus-4-7",
-      }),
-    ).toEqual({ provider: "anthropic", model: "claude-opus-4-7" });
-  });
-});
-
 describe("deriveSessionTitle", () => {
   test("returns undefined for undefined entry", () => {
     expect(deriveSessionTitle(undefined)).toBeUndefined();
@@ -3254,22 +3488,15 @@ describe("deriveSessionTitle", () => {
     expect(result.includes("  ")).toBe(false);
   });
 
-  test("falls back to sessionId prefix with date", () => {
+  test("leaves a failed dashboard thread untitled so the UI can render New thread", () => {
     const entry = {
       sessionId: "abcd1234-5678-90ef-ghij-klmnopqrstuv",
       updatedAt: new Date("2024-03-15T10:30:00Z").getTime(),
     } as SessionEntry;
-    const result = deriveSessionTitle(entry);
-    expect(result).toBe("abcd1234 (2024-03-15)");
-  });
 
-  test("falls back to sessionId prefix without date when updatedAt missing", () => {
-    const entry = {
-      sessionId: "abcd1234-5678-90ef-ghij-klmnopqrstuv",
-      updatedAt: 0,
-    } as SessionEntry;
-    const result = deriveSessionTitle(entry);
-    expect(result).toBe("abcd1234");
+    expect(deriveSessionTitle(entry)).toBeUndefined();
+    expect(deriveSessionTitle(entry, "")).toBeUndefined();
+    expect(deriveSessionTitle(entry, "   ")).toBeUndefined();
   });
 
   test("trims whitespace from displayName", () => {

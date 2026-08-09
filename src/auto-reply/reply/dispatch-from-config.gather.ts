@@ -38,7 +38,10 @@ import { createShouldEmitVerboseProgress } from "./dispatch-from-config.harness-
 import { createDispatchReplyOperationCoordinator } from "./dispatch-from-config.lifecycle.js";
 import { createFinalizationAwareTtsPayloadApplier } from "./dispatch-from-config.payloads.js";
 import { extendPreparedDispatchState } from "./dispatch-from-config.phase-state.js";
-import { loadRuntimePlugins } from "./dispatch-from-config.runtime-loaders.js";
+import {
+  loadPreparedModelRuntime,
+  loadRuntimePlugins,
+} from "./dispatch-from-config.runtime-loaders.js";
 import { createReplyHotPathTimingTracker } from "./dispatch-from-config.timing.js";
 import type { DispatchFromConfigParams } from "./dispatch-from-config.types.js";
 import { resolveEffectiveReplyRoute } from "./effective-reply-route.js";
@@ -321,7 +324,14 @@ export async function gatherDispatchRequest(
   const routeReplyThreadId = replyRoute.threadId ?? routeThreadId;
   const inboundAudio = hasInboundAudio(ctx);
   const sessionTtsAuto = normalizeTtsAutoMode(sessionStoreEntry.entry?.ttsAuto);
-  const workspaceDir = resolveAgentWorkspaceDir(cfg, sessionAgentId);
+  const preparedReplyDispatchRuntime = params.usePublishedModelRuntime
+    ? await traceReplyPhase("reply.load_prepared_dispatch_runtime", async () => {
+        const { loadPublishedGatewayReplyDispatchRuntime } = await loadPreparedModelRuntime();
+        return await loadPublishedGatewayReplyDispatchRuntime({ agentId: sessionAgentId });
+      })
+    : undefined;
+  const workspaceDir =
+    preparedReplyDispatchRuntime?.workspaceDir ?? resolveAgentWorkspaceDir(cfg, sessionAgentId);
   const replyOperationCoordinator = createDispatchReplyOperationCoordinator({
     ctx,
     dispatcher,
@@ -358,12 +368,19 @@ export async function gatherDispatchRequest(
     hasInboundAudio: () =>
       inboundAudio || getDispatchReplyOperation()?.acceptedSteeredInboundAudio === true,
   });
-  const { ensureRuntimePluginsLoaded } = await traceReplyPhase("reply.load_runtime_plugins", () =>
-    loadRuntimePlugins(),
-  );
-  await traceReplyPhase("reply.ensure_runtime_plugins", () => {
-    ensureRuntimePluginsLoaded({ config: cfg, workspaceDir });
-  });
+  const pluginRegistry =
+    preparedReplyDispatchRuntime?.inboundPluginRegistry ??
+    (await traceReplyPhase("reply.load_runtime_plugin_registry_handle", async () => {
+      const { loadAgentRuntimePluginRegistryHandle } = await traceReplyPhase(
+        "reply.load_runtime_plugins",
+        loadRuntimePlugins,
+      );
+      return loadAgentRuntimePluginRegistryHandle({
+        config: cfg,
+        workspaceDir,
+        allowGatewaySubagentBinding: true,
+      });
+    }));
   const hookRunner = getGlobalHookRunner();
   // Extract message context for hooks (plugin and internal)
   const timestamp =
@@ -462,6 +479,8 @@ export async function gatherDispatchRequest(
     inboundAudio,
     sessionTtsAuto,
     workspaceDir,
+    preparedReplyDispatchRuntime,
+    pluginRegistry,
     replyOperationRunState,
     completeDispatchReplyOperation,
     dispatchHookDispatcher,

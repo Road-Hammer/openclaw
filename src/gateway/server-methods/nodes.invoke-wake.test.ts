@@ -69,7 +69,7 @@ vi.mock("../../config/io.js", () => ({
   getRuntimeConfig: mocks.getRuntimeConfig,
 }));
 
-vi.mock("../../infra/node-pairing-state.js", () => ({
+vi.mock("../../infra/device-pairing-node-state.js", () => ({
   captureNodePairingGeneration: mocks.captureNodePairingGeneration,
   isNodePairingGenerationCurrent: mocks.isNodePairingGenerationCurrent,
 }));
@@ -95,9 +95,9 @@ vi.mock("../../infra/push-apns.js", () => ({
   shouldClearStoredApnsRegistration: mocks.shouldClearStoredApnsRegistration,
 }));
 
-vi.mock("../../infra/node-pairing.js", async () => {
-  const actual = await vi.importActual<typeof import("../../infra/node-pairing.js")>(
-    "../../infra/node-pairing.js",
+vi.mock("../../infra/device-pairing-node.js", async () => {
+  const actual = await vi.importActual<typeof import("../../infra/device-pairing-node.js")>(
+    "../../infra/device-pairing-node.js",
   );
   return {
     ...actual,
@@ -991,6 +991,11 @@ describe("node.invoke APNs wake path", () => {
     expect(call[0]).toBe(false);
     expect(call[2]?.code).toBe(ErrorCodes.UNAVAILABLE);
     expect(call[2]?.message).toBe("node not connected");
+    expect(call[2]?.details).toEqual({
+      code: "NOT_CONNECTED",
+      nodeError: { code: "NOT_CONNECTED", message: "node not connected" },
+      nodeCommandDispatched: false,
+    });
     expect(mocks.sendApnsBackgroundWake).not.toHaveBeenCalled();
     expect(nodeRegistry.invoke).not.toHaveBeenCalled();
   });

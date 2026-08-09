@@ -1,7 +1,13 @@
 // Tests dispatch-from-config reply dispatch integration and final payload routing.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../test/helpers/promise.js";
 import { clearAgentHarnesses } from "../../agents/harness/registry.js";
+import {
+  OutboundDeliveryError,
+  PlatformMessageNotDispatchedError,
+} from "../../infra/outbound/deliver-types.js";
 import type { PluginHookReplyDispatchResult } from "../../plugins/hooks.test-fixtures.js";
+import { getPluginRuntimeGatewayRequestScope } from "../../plugins/runtime/gateway-request-scope.js";
 import { createInternalHookEventPayload } from "../../test-utils/internal-hook-event-payload.js";
 import { withReplyDispatcher } from "../dispatch-dispatcher.js";
 import { setReplyPayloadMetadata } from "../reply-payload.js";
@@ -35,12 +41,6 @@ let resetReplyRunRegistry: typeof import("./reply-run-registry.test-support.js")
 
 const REPLY_RUN_FINALIZATION_SETTLE_TIMEOUT_MS = 60_000;
 
-function firstRuntimeLoadCall() {
-  return runtimePluginMocks.ensureRuntimePluginsLoaded.mock.calls[0]?.[0] as
-    | { config?: unknown; workspaceDir?: unknown }
-    | undefined;
-}
-
 function firstReplyDispatchCall() {
   return hookMocks.runner.runReplyDispatch.mock.calls[0] as
     | [
@@ -55,14 +55,6 @@ function firstReplyDispatchCall() {
         },
       ]
     | undefined;
-}
-
-function createDeferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>((res) => {
-    resolve = res;
-  });
-  return { promise, resolve };
 }
 
 function pendingFinalDelivery(
@@ -154,15 +146,23 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
     diagnosticMocks.logMessageProcessed.mockReset();
     diagnosticMocks.logSessionStateChange.mockReset();
     diagnosticMocks.markDiagnosticSessionProgress.mockReset();
-    runtimePluginMocks.ensureRuntimePluginsLoaded.mockReset();
+    runtimePluginMocks.loadAgentRuntimePluginRegistryHandle.mockReset();
+    runtimePluginMocks.loadAgentRuntimePluginRegistryHandle.mockReturnValue(
+      runtimePluginMocks.pluginRegistry,
+    );
     resetPluginTtsAndThreadMocks();
   });
 
-  it("returns handled dispatch results from plugins", async () => {
-    hookMocks.runner.runReplyDispatch.mockResolvedValue({
-      handled: true,
-      queuedFinal: true,
-      counts: { tool: 1, block: 2, final: 3 },
+  it("runs a handled plugin reply hook in the registry scope", async () => {
+    hookMocks.runner.runReplyDispatch.mockImplementation(async () => {
+      expect(getPluginRuntimeGatewayRequestScope()?.pluginRegistry).toBe(
+        runtimePluginMocks.pluginRegistry,
+      );
+      return {
+        handled: true,
+        queuedFinal: true,
+        counts: { tool: 1, block: 2, final: 3 },
+      };
     });
 
     const result = await dispatchReplyFromConfig({
@@ -175,12 +175,11 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       replyResolver: async () => ({ text: "model reply" }),
     });
 
-    expect(runtimePluginMocks.ensureRuntimePluginsLoaded).toHaveBeenCalledOnce();
-    const runtimeLoadCall = firstRuntimeLoadCall();
-    expect(runtimeLoadCall?.config).toBe(emptyConfig);
-    expect(typeof runtimeLoadCall?.workspaceDir).toBe("string");
-    expect(String(runtimeLoadCall?.workspaceDir).length).toBeGreaterThan(0);
-
+    expect(runtimePluginMocks.loadAgentRuntimePluginRegistryHandle).toHaveBeenCalledWith({
+      config: emptyConfig,
+      workspaceDir: expect.any(String),
+      allowGatewaySubagentBinding: true,
+    });
     expect(hookMocks.runner.runReplyDispatch).toHaveBeenCalledOnce();
     const [replyDispatchEvent, replyDispatchRuntime] = firstReplyDispatchCall() ?? [];
     expect(replyDispatchEvent?.sessionKey).toBe("agent:test:session");
@@ -345,7 +344,7 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       sessionStoreMocks.resolveSessionStoreEntry.mockReturnValue({
         existing: sessionStoreMocks.currentEntry,
       });
-      const hookStarted = createDeferred<void>();
+      const hookStarted = createDeferred();
       const deliver = vi.fn().mockResolvedValue(undefined);
       const dispatcher = createReplyDispatcher({
         deliver,
@@ -400,7 +399,7 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       sessionStoreMocks.resolveSessionStoreEntry.mockReturnValue({
         existing: sessionStoreMocks.currentEntry,
       });
-      const hookStarted = createDeferred<void>();
+      const hookStarted = createDeferred();
       const deliver = vi.fn().mockResolvedValue(undefined);
       let hookCalls = 0;
       const dispatcher = createReplyDispatcher({
@@ -453,7 +452,7 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       sessionStoreMocks.resolveSessionStoreEntry.mockReturnValue({
         existing: sessionStoreMocks.currentEntry,
       });
-      const hookStarted = createDeferred<void>();
+      const hookStarted = createDeferred();
       const deliver = vi.fn().mockResolvedValue(undefined);
       let hookCalls = 0;
       const dispatcher = createReplyDispatcher({
@@ -507,7 +506,7 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       sessionStoreMocks.resolveSessionStoreEntry.mockReturnValue({
         existing: sessionStoreMocks.currentEntry,
       });
-      const hookStarted = createDeferred<void>();
+      const hookStarted = createDeferred();
       let hookCalls = 0;
       const dispatcher = createReplyDispatcher({
         deliver: vi.fn().mockResolvedValue(undefined),
@@ -557,7 +556,7 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       sessionStoreMocks.resolveSessionStoreEntry.mockReturnValue({
         existing: sessionStoreMocks.currentEntry,
       });
-      const hookStarted = createDeferred<void>();
+      const hookStarted = createDeferred();
       let hookCalls = 0;
       const dispatcher = createReplyDispatcher({
         deliver: vi.fn().mockResolvedValue(undefined),
@@ -620,7 +619,7 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       sessionStoreMocks.resolveSessionStoreEntry.mockReturnValue({
         existing: sessionStoreMocks.currentEntry,
       });
-      const hookStarted = createDeferred<void>();
+      const hookStarted = createDeferred();
       const dispatcher = createReplyDispatcher({
         deliver: vi.fn().mockResolvedValue(undefined),
         beforeDeliver: () => {
@@ -663,21 +662,54 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
     }
   });
 
-  it("clears pending final delivery after transport delivery has started", async () => {
+  const createNoSendFailure = (retryable = true) =>
+    new PlatformMessageNotDispatchedError("offline", { cause: new Error("offline"), retryable });
+  const wrapDeliveryFailure = (cause: unknown) =>
+    new OutboundDeliveryError("delivery failed", { cause });
+  const refused = Object.assign(new Error(), {
+    code: "ECONNREFUSED",
+    syscall: "connect",
+  });
+  const createPartialDelivery = () =>
+    Object.assign(new Error("partial delivery", { cause: createNoSendFailure() }), {
+      code: "CHANNEL_PARTIAL_DELIVERY",
+      deliveryResult: { visibleReplySent: true },
+    });
+
+  it.each([
+    ["direct retryable provider proof", createNoSendFailure(), true],
+    ["wrapped retryable provider proof", wrapDeliveryFailure(createNoSendFailure()), true],
+    ["wrapped pre-connect ECONNREFUSED proof", wrapDeliveryFailure(refused), true],
+    ["permanent provider rejection", createNoSendFailure(false), false],
+    [
+      "partial outbound delivery",
+      Object.assign(wrapDeliveryFailure(createNoSendFailure()), { sentBeforeError: true }),
+      false,
+    ],
+    ["nested partial envelope", new Error("partial", { cause: createPartialDelivery() }), false],
+    ["aggregate partial envelope", new AggregateError([createPartialDelivery()]), false],
+    ["observer-attached delivery evidence", createNoSendFailure(), false],
+    ["ambiguous transport failure", new Error("transport failed"), false],
+  ] as const)("reconciles pending final delivery after %s", async (name, error, preserve) => {
     hookMocks.runner.hasHooks.mockReturnValue(false);
+    const pending = pendingFinalDelivery("recoverable final reply");
     sessionStoreMocks.currentEntry = {
       sessionKey: "agent:test:session",
-      pendingFinalDelivery: pendingFinalDelivery("possibly visible reply"),
+      pendingFinalDelivery: pending,
     };
     sessionStoreMocks.resolveSessionStoreEntry.mockReturnValue({
       existing: sessionStoreMocks.currentEntry,
     });
     const dispatcher = createReplyDispatcher({
       deliver: async () => {
-        throw new Error("transport failed after send started");
+        throw error;
+      },
+      onError: () => {
+        if (name.startsWith("observer")) {
+          Object.assign(error, { visibleReplySent: true });
+        }
       },
     });
-
     await withReplyDispatcher({
       dispatcher,
       run: () =>
@@ -685,15 +717,12 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
           ctx: createHookCtx(),
           cfg: emptyConfig,
           dispatcher,
-          replyResolver: async () => ({ text: "possibly visible reply" }),
+          replyResolver: async () => ({ text: "recoverable final reply" }),
         }),
     });
-
-    // A started-then-failed transport send may have shown partial content, so
-    // the ledger stays conservative and no fallback rides the same transport.
-    expect(dispatcher.getFailedCounts?.()).toEqual({ tool: 0, block: 0, final: 1 });
-    expect(sessionStoreMocks.updateSessionEntry).toHaveBeenCalledOnce();
-    expect(sessionStoreMocks.currentEntry?.pendingFinalDelivery).toBeUndefined();
+    expect(sessionStoreMocks.currentEntry?.pendingFinalDelivery).toEqual(
+      preserve ? pending : undefined,
+    );
   });
 
   it("clears pending final delivery after intentional pre-delivery cancellation", async () => {
@@ -779,8 +808,8 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
 
   it("releases a stalled finalizing dispatch and rejects its late reply", async () => {
     vi.useFakeTimers();
-    const ownerStarted = createDeferred<void>();
-    const releaseOwner = createDeferred<void>();
+    const ownerStarted = createDeferred();
+    const releaseOwner = createDeferred();
     const dispatcher = createDispatcher();
     let successor: ReturnType<typeof createReplyOperation> | undefined;
     hookMocks.runner.hasHooks.mockReturnValue(false);
@@ -828,8 +857,8 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
 
   it("keeps bounded TTS fallback work alive past the default finalization lease", async () => {
     vi.useFakeTimers();
-    const ttsStarted = createDeferred<void>();
-    const releaseTts = createDeferred<void>();
+    const ttsStarted = createDeferred();
+    const releaseTts = createDeferred();
     const dispatcher = createDispatcher();
     hookMocks.runner.hasHooks.mockReturnValue(false);
     ttsMocks.maybeApplyTtsToPayload.mockImplementation(async (paramsUnknown: unknown) => {

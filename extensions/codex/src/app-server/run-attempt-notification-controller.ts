@@ -207,22 +207,28 @@ export function createCodexAttemptNotificationController(
         if (completedTurn?.status === "interrupted" && state.sawCodexInterruptMarker) {
           projector.markAborted();
         }
-        if (!state.timedOut && !runAbortController.signal.aborted) {
-          await steeringQueue?.flushPending();
-        }
         completeTurn();
       }
     }
   };
   const waitForActiveNativeTurnCompletion = async () => {
     const route = resourceState.turnRoute;
-    if (!route) {
+    const activeNativeTurnId =
+      resourceState.thread.lifecycle.activeTurnIds?.at(-1) ?? route?.observedNativeTurnId;
+    if (!route || !activeNativeTurnId) {
       return false;
     }
-    return await route.waitForTurnCompletion({
+    const watch = resourceState.turnRouter.watchNativeTurnCompletion({
+      threadId: route.threadId,
+      turnId: activeNativeTurnId,
       timeoutMs: Math.min(appServer.requestTimeoutMs, CODEX_APP_SERVER_NATIVE_TURN_WAIT_TIMEOUT_MS),
       signal: runAbortController.signal,
     });
+    try {
+      return await watch.completion;
+    } finally {
+      watch.cancel();
+    }
   };
   const noteNotificationReceived = (
     notification: CodexServerNotification,
@@ -236,6 +242,7 @@ export function createCodexAttemptNotificationController(
     }
     if (isTerminalTurnNotificationForTurn(notification, turnId)) {
       state.terminalTurnNotificationQueued = true;
+      steeringQueueRef.current?.sealAdmission();
     }
     if (scope.turnId === turnId) {
       const modelToolCallId = readRawResponseToolCallId(notification);

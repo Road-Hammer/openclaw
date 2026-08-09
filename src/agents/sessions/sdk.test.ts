@@ -313,7 +313,117 @@ describe("AgentSession getLastAssistantText", () => {
   });
 });
 
+describe("AgentSession tree navigation", () => {
+  it("leaves the tree unchanged when branch summarization returns reasoning only", async () => {
+    const authStorage = AuthStorage.inMemory();
+    authStorage.setRuntimeApiKey(testModel.provider, "test-api-key");
+    const sessionManager = SessionManager.inMemory();
+    const rootId = sessionManager.appendMessage({
+      role: "user",
+      content: "shared root",
+      timestamp: 1,
+    });
+    const abandonedLeafId = sessionManager.appendMessage({
+      role: "user",
+      content: "abandoned branch",
+      timestamp: 2,
+    });
+    sessionManager.branch(rootId);
+    const targetId = sessionManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "target branch" }],
+      api: testModel.api,
+      provider: testModel.provider,
+      model: testModel.id,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: 3,
+    });
+    sessionManager.branch(abandonedLeafId);
+    streamMocks.streamSimple.mockReset();
+    streamMocks.streamSimple.mockImplementation(() =>
+      createAssistantResultStream({
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "internal summary reasoning" }],
+        api: testModel.api,
+        provider: testModel.provider,
+        model: testModel.id,
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: 4,
+      }),
+    );
+    const { session } = await createAgentSession({
+      authStorage,
+      model: testModel,
+      resourceLoader: createEmptyResourceLoader(),
+      sessionManager,
+      settingsManager: SettingsManager.inMemory(),
+      modelRegistry: createTestModelRegistry(authStorage),
+    });
+    const entriesBefore = sessionManager.getEntries();
+    const leafBefore = sessionManager.getLeafId();
+
+    await expect(session.navigateTree(targetId, { summarize: true })).rejects.toThrow(
+      "Branch summary failed: model returned no summary text",
+    );
+
+    expect(streamMocks.streamSimple).toHaveBeenCalledOnce();
+    expect(sessionManager.getEntries()).toEqual(entriesBefore);
+    expect(sessionManager.getLeafId()).toBe(leafBefore);
+    expect(sessionManager.getEntries().some((entry) => entry.type === "branch_summary")).toBe(
+      false,
+    );
+    session.dispose();
+  });
+});
+
 describe("AgentSession queued user turns", () => {
+  it("rechecks captured steering ownership after transcript preparation", async () => {
+    const session = await createSessionFromManager(SessionManager.inMemory());
+    let resolveInput!: () => void;
+    const inputReady = new Promise<void>((resolve) => {
+      resolveInput = resolve;
+    });
+    const recorder = createUserTurnTranscriptRecorder({
+      resolveInput: async () => {
+        await inputReady;
+        return { text: "visible prompt" };
+      },
+      target: createTestUserTurnTranscriptTarget(),
+    });
+    const steer = vi.spyOn(session.agent, "steer").mockImplementation(() => undefined);
+    let canInject = true;
+    const queued = session.steer(
+      "runtime prompt",
+      undefined,
+      recorder,
+      undefined,
+      undefined,
+      "queue-identity",
+      () => canInject,
+    );
+    canInject = false;
+    resolveInput();
+
+    await expect(queued).rejects.toThrow("active session is finalizing");
+    expect(steer).not.toHaveBeenCalled();
+  });
+
   it("carries prepared transcript context on the exact steered message", async () => {
     const session = await createSessionFromManager(SessionManager.inMemory());
     const recorder = createUserTurnTranscriptRecorder({

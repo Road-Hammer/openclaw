@@ -35,6 +35,17 @@ import type {
 
 const log = createSubsystemLogger("gateway/terminal");
 
+// Task binding is manager-private metadata: public terminal ownership stays
+// conversation-scoped while lifecycle cleanup can target the exact producer.
+type TaskBoundAgentOwner = Extract<TerminalOwner, { kind: "agent" }> & { taskId?: string };
+
+function terminalOwnerMatches(owner: TerminalOwner | null, ownerKey: string): boolean {
+  if (owner?.kind !== "agent") {
+    return false;
+  }
+  return owner.agentSessionKey === ownerKey || (owner as TaskBoundAgentOwner).taskId === ownerKey;
+}
+
 /**
  * Tracks live PTY sessions keyed by session id, with a reverse index for
  * connection owners and viewers so disconnect cleanup stays bounded.
@@ -381,6 +392,17 @@ export class TerminalSessionManager {
     return true;
   }
 
+  /** Closes every PTY owned by one exact agent session. */
+  closeAgentSessions(agentSessionKey: string): number {
+    const owned = [...this.sessions.values()].filter(
+      (session) => !session.closed && terminalOwnerMatches(session.owner, agentSessionKey),
+    );
+    for (const session of owned) {
+      this.finalize(session, "closed", {});
+    }
+    return owned.length;
+  }
+
   /**
    * Rebinds a connection-owned session, or co-attaches a viewer to an
    * agent-owned session. Operator-to-operator attach remains take-over; only
@@ -662,6 +684,9 @@ export class TerminalSessionManager {
       // With no socket pressure left, resume immediately. Buffered bytes stay
       // in the replay ring and the next viewer starts at its high-water mark.
       session.output.resetOwnership();
+    } else {
+      // A departed slow viewer must not leave healthy co-viewers stalled.
+      session.output.reconcileRecipients();
     }
     return true;
   }
