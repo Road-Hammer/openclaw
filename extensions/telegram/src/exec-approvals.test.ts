@@ -95,16 +95,17 @@ function buildMultiAccountTelegramConfig(params: {
   } as OpenClawConfig;
 }
 
-function makeForeignChannelApprovalRequest(params: {
+function makeChannelApprovalRequest(params: {
   id: string;
   sessionKey?: string;
+  turnSourceChannel?: string;
 }): TelegramExecApprovalRequest {
   return {
     id: params.id,
     request: {
       command: "echo hi",
       sessionKey: params.sessionKey ?? "agent:ops:missing",
-      turnSourceChannel: "slack",
+      turnSourceChannel: params.turnSourceChannel ?? "slack",
       turnSourceTo: "channel:C123",
     },
     createdAtMs: 0,
@@ -168,7 +169,7 @@ describe("telegram exec approvals", () => {
     expect(isTelegramExecApprovalApprover({ cfg, senderId: "67890" })).toBe(true);
   });
 
-  it("does not require explicit Telegram exec approvers when command owner identifies the Telegram operator", () => {
+  it("does not require explicit Telegram exec approvers when command owner identifies the operator", () => {
     const cfg = {
       ...buildConfig(),
       commands: {
@@ -182,7 +183,10 @@ describe("telegram exec approvals", () => {
     expect(
       shouldHandleTelegramExecApprovalRequest({
         cfg,
-        request: makeForeignChannelApprovalRequest({ id: "discord-diagnostics" }),
+        request: makeChannelApprovalRequest({
+          id: "telegram-diagnostics",
+          turnSourceChannel: "telegram",
+        }),
       }),
     ).toBe(true);
   });
@@ -252,7 +256,7 @@ describe("telegram exec approvals", () => {
       },
     });
     const cfg = buildMultiAccountTelegramConfig({ sessionStorePath: storePath });
-    const request = makeForeignChannelApprovalRequest({
+    const request = makeChannelApprovalRequest({
       id: "req-2",
       sessionKey: "agent:ops:telegram:direct:123",
     });
@@ -273,31 +277,30 @@ describe("telegram exec approvals", () => {
     ).toBe(true);
   });
 
-  it("rejects unbound foreign-channel approvals in multi-account telegram configs", () => {
+  it("reports each eligible same-channel account as a raw route candidate", () => {
     const cfg = buildMultiAccountTelegramConfig({});
-    const request = makeForeignChannelApprovalRequest({ id: "req-3" });
+    const request: TelegramExecApprovalRequest = {
+      id: "req-same-channel-unbound",
+      request: {
+        command: "echo hi",
+        turnSourceChannel: "telegram",
+        sessionKey: "agent:ops:missing",
+      },
+      createdAtMs: 0,
+      expiresAtMs: 1000,
+    };
 
-    expect(
-      shouldHandleTelegramExecApprovalRequest({
-        cfg,
-        accountId: "default",
-        request,
-      }),
-    ).toBe(false);
-    expect(
-      shouldHandleTelegramExecApprovalRequest({
-        cfg,
-        accountId: "ops",
-        request,
-      }),
-    ).toBe(false);
+    expect(shouldHandleTelegramExecApprovalRequest({ cfg, accountId: "default", request })).toBe(
+      true,
+    );
+    expect(shouldHandleTelegramExecApprovalRequest({ cfg, accountId: "ops", request })).toBe(true);
   });
 
-  it("allows unbound foreign-channel approvals when only one telegram account can handle them", () => {
+  it("rejects unbound foreign-channel approvals even when only one telegram account can handle them", () => {
     const cfg = buildMultiAccountTelegramConfig({
       opsExecApprovals: { enabled: false, approvers: ["123"] },
     });
-    const request = makeForeignChannelApprovalRequest({ id: "req-4" });
+    const request = makeChannelApprovalRequest({ id: "req-4" });
 
     expect(
       shouldHandleTelegramExecApprovalRequest({
@@ -305,7 +308,7 @@ describe("telegram exec approvals", () => {
         accountId: "default",
         request,
       }),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       shouldHandleTelegramExecApprovalRequest({
         cfg,
@@ -315,7 +318,7 @@ describe("telegram exec approvals", () => {
     ).toBe(false);
   });
 
-  it("uses request filters when checking foreign-channel telegram ambiguity", () => {
+  it("uses request filters when checking unbound telegram account eligibility", () => {
     const cfg = buildMultiAccountTelegramConfig({
       defaultExecApprovals: {
         enabled: true,
@@ -328,7 +331,10 @@ describe("telegram exec approvals", () => {
         agentFilter: ["other"],
       },
     });
-    const request = makeForeignChannelApprovalRequest({ id: "req-5" });
+    const request = makeChannelApprovalRequest({
+      id: "req-5",
+      turnSourceChannel: "telegram",
+    });
 
     expect(
       shouldHandleTelegramExecApprovalRequest({
@@ -384,8 +390,18 @@ describe("telegram exec approvals", () => {
   });
 
   it("preserves unscoped telegram targets when mixed with scoped target accountIds", () => {
+    const baseCfg = buildMultiAccountTelegramConfig({});
     const cfg = {
-      ...buildMultiAccountTelegramConfig({}),
+      ...baseCfg,
+      channels: {
+        telegram: {
+          ...baseCfg.channels?.telegram,
+          accounts: {
+            ...baseCfg.channels?.telegram?.accounts,
+            other: telegramAccount("other", { enabled: true, approvers: ["123"] }),
+          },
+        },
+      },
       approvals: {
         exec: {
           enabled: true,
@@ -421,11 +437,21 @@ describe("telegram exec approvals", () => {
         request,
       }),
     ).toBe(true);
+    expect(
+      shouldHandleTelegramExecApprovalRequest({
+        cfg,
+        accountId: "other",
+        request,
+      }),
+    ).toBe(false);
   });
 
-  it("ignores disabled telegram accounts when checking foreign-channel ambiguity", () => {
+  it("ignores disabled telegram accounts when checking unbound account eligibility", () => {
     const cfg = buildMultiAccountTelegramConfig({ opsOverrides: { enabled: false } });
-    const request = makeForeignChannelApprovalRequest({ id: "req-6" });
+    const request = makeChannelApprovalRequest({
+      id: "req-6",
+      turnSourceChannel: "telegram",
+    });
 
     expect(
       shouldHandleTelegramExecApprovalRequest({

@@ -45,7 +45,7 @@ const coreCliCommandCatalog = defineCommandDescriptorCatalog([
   },
   {
     name: "backup",
-    description: "Create and verify backup archives and SQLite snapshots",
+    description: "Create, verify, and restore backup archives and SQLite snapshots",
     hasSubcommands: true,
   },
   {
@@ -122,13 +122,14 @@ const coreCliCommandCatalog = defineCommandDescriptorCatalog([
     hasSubcommands: false,
   },
   {
-    name: "sessions",
-    description: "List stored conversation sessions",
+    name: "delivery",
+    description: "Inspect and maintain durable delivery state",
     hasSubcommands: true,
+    parentDefaultHelp: true,
   },
   {
-    name: "commitments",
-    description: "List and manage inferred follow-up commitments",
+    name: "sessions",
+    description: "List stored conversation sessions",
     hasSubcommands: true,
   },
   {
@@ -153,7 +154,7 @@ export function getCoreCliCommandDescriptors(): ReadonlyArray<CoreCliCommandDesc
 }
 
 /** Return names for all core root commands. */
-export function getCoreCliCommandNames(): string[] {
+export function getCoreCliCommandNamesCore(): string[] {
   return visibleCoreCliCommandDescriptors().map((descriptor) => descriptor.name);
 }
 

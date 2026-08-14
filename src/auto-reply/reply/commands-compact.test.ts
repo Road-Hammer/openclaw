@@ -17,7 +17,6 @@ vi.mock("./commands-compact.runtime.js", () => ({
   incrementCompactionCount: vi.fn(),
   isEmbeddedAgentRunAbortableForCompaction: vi.fn().mockReturnValue(false),
   resolveFreshSessionTotalTokens: vi.fn(() => 12_345),
-  resolveSessionFilePath: vi.fn(() => "/tmp/session.json"),
   resolveSessionFilePathOptions: vi.fn(() => ({})),
   waitForEmbeddedAgentRunEnd: vi.fn().mockResolvedValue(true),
 }));
@@ -647,6 +646,7 @@ describe("handleCompactCommand", () => {
     vi.mocked(compactEmbeddedAgentSession).mockResolvedValueOnce({
       ok: true,
       compacted: true,
+      compactionKind: "context-engine",
       result: {
         summary: "compacted",
         firstKeptEntryId: "first-kept",
@@ -681,6 +681,7 @@ describe("handleCompactCommand", () => {
       throw new Error("incrementCompactionCount sessionEntry missing");
     }
     expect(call.sessionEntry.sessionId).toBe("target-session");
+    expect(call.compactionKind).toBe("context-engine");
     expect(call.tokensAfter).toBe(321);
   });
 
@@ -713,6 +714,7 @@ describe("handleCompactCommand", () => {
   it.each([
     {
       owner: "Codex",
+      compactionKind: "native-harness" as const,
       details: {
         backend: "codex-app-server",
         threadId: "thread-1",
@@ -723,14 +725,21 @@ describe("handleCompactCommand", () => {
     },
     {
       owner: "Copilot",
+      compactionKind: "native-harness" as const,
       details: { success: true, tokensRemoved: 45, messagesRemoved: 2 },
     },
-    { owner: "context engine", details: undefined, successor: "successor-session" },
+    {
+      owner: "context engine",
+      compactionKind: "context-engine" as const,
+      details: undefined,
+      successor: "successor-session",
+    },
   ])("counts confirmed $owner compaction without a post-compaction count", async (testCase) => {
     const { details } = testCase;
     vi.mocked(compactEmbeddedAgentSession).mockResolvedValueOnce({
       ok: true,
       compacted: true,
+      compactionKind: testCase.compactionKind,
       result: {
         summary: "",
         firstKeptEntryId: "",
@@ -757,6 +766,7 @@ describe("handleCompactCommand", () => {
     );
 
     expect(vi.mocked(incrementCompactionCount)).toHaveBeenCalledOnce();
+    expect(requireIncrementCompactionCountCall().compactionKind).toBe(testCase.compactionKind);
     expect(requireIncrementCompactionCountCall().tokensAfter).toBeUndefined();
     if ("successor" in testCase) {
       expect(requireIncrementCompactionCountCall().newSessionId).toBe("successor-session");

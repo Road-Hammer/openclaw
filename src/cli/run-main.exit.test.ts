@@ -58,6 +58,11 @@ const closeActiveMemorySearchManagersMock = vi.hoisted(() => vi.fn(async () => {
 const hasMemoryRuntimeMock = vi.hoisted(() => vi.fn(() => false));
 const listRegisteredAgentHarnessesMock = vi.hoisted(() => vi.fn((): unknown[] => []));
 const disposeRegisteredAgentHarnessesMock = vi.hoisted(() => vi.fn(async () => {}));
+const hasManagedProviderLocalServicesMock = vi.hoisted(() => vi.fn(() => false));
+const hasProviderTransportDispatcherPoolMock = vi.hoisted(() => vi.fn(() => false));
+const providerCleanupModuleImportState = vi.hoisted(() => ({ local: 0, transport: 0 }));
+const stopManagedProviderLocalServicesMock = vi.hoisted(() => vi.fn());
+const closeProviderTransportDispatcherPoolMock = vi.hoisted(() => vi.fn(async () => {}));
 const getActiveMcpLoopbackRuntimeMock = vi.hoisted(() =>
   vi.fn<() => { port: number } | undefined>(() => undefined),
 );
@@ -116,6 +121,9 @@ const readLocalOnboardingStateMock = vi.hoisted(() =>
 const setupWizardCommandMock = vi.hoisted(() => vi.fn(async () => {}));
 const runRemoteGatewayInferenceOnboardingMock = vi.hoisted(() => vi.fn(async () => {}));
 const runTuiMock = vi.hoisted(() => vi.fn<(opts: unknown) => Promise<void>>(async () => {}));
+const runTuiCliActionMock = vi.hoisted(() =>
+  vi.fn<(target: string | undefined, opts: unknown) => Promise<void>>(async () => {}),
+);
 const probeGatewayConfiguredModelMock = vi.hoisted(() =>
   vi.fn<
     () => Promise<{
@@ -265,8 +273,6 @@ vi.mock("./one-shot-exit.js", () => ({
 
 vi.mock("../infra/env.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../infra/env.js")>()),
-  isTruthyEnvValue: (value?: string) =>
-    typeof value === "string" && ["1", "on", "true", "yes"].includes(value.trim().toLowerCase()),
   normalizeEnv: normalizeEnvMock,
 }));
 
@@ -303,7 +309,7 @@ vi.mock("../infra/runtime-guard.js", () => ({
 }));
 
 vi.mock("../plugins/memory-runtime.js", () => ({
-  closeActiveMemorySearchManagers: closeActiveMemorySearchManagersMock,
+  closeActiveMemorySearchManagersCore: closeActiveMemorySearchManagersMock,
 }));
 
 vi.mock("../plugins/memory-state.js", () => ({
@@ -314,6 +320,21 @@ vi.mock("../agents/harness/registry.js", () => ({
   listRegisteredAgentHarnesses: listRegisteredAgentHarnessesMock,
   disposeRegisteredAgentHarnesses: disposeRegisteredAgentHarnessesMock,
 }));
+
+vi.mock("../agents/provider-runtime-lifecycle.js", () => ({
+  hasManagedProviderLocalServices: hasManagedProviderLocalServicesMock,
+  hasProviderTransportDispatcherPool: hasProviderTransportDispatcherPoolMock,
+}));
+
+vi.mock("../agents/provider-local-service.js", () => {
+  providerCleanupModuleImportState.local += 1;
+  return { stopManagedProviderLocalServices: stopManagedProviderLocalServicesMock };
+});
+
+vi.mock("../agents/provider-transport-dispatcher-pool.js", () => {
+  providerCleanupModuleImportState.transport += 1;
+  return { closeProviderTransportDispatcherPool: closeProviderTransportDispatcherPoolMock };
+});
 
 vi.mock("../gateway/mcp-http.loopback-runtime.js", () => ({
   getActiveMcpLoopbackRuntime: getActiveMcpLoopbackRuntimeMock,
@@ -421,6 +442,10 @@ vi.mock("../commands/onboard-helpers.js", () => ({
 
 vi.mock("../tui/tui.js", () => ({
   runTui: runTuiMock,
+}));
+
+vi.mock("./tui-cli.js", () => ({
+  runTuiCliAction: runTuiCliActionMock,
 }));
 
 vi.mock("./progress.js", () => ({
@@ -553,6 +578,8 @@ describe("runCli exit behavior", () => {
     });
     hasMemoryRuntimeMock.mockReturnValue(false);
     listRegisteredAgentHarnessesMock.mockReturnValue([]);
+    hasManagedProviderLocalServicesMock.mockReturnValue(false);
+    hasProviderTransportDispatcherPoolMock.mockReturnValue(false);
     outputPrecomputedBrowserHelpTextMock.mockReturnValue(false);
     outputPrecomputedNodesHelpTextMock.mockReturnValue(false);
     outputPrecomputedRootHelpTextMock.mockReturnValue(false);
@@ -576,6 +603,22 @@ describe("runCli exit behavior", () => {
     delete process.env.OPENCLAW_DISABLE_CLI_STARTUP_HELP_FAST_PATH;
     delete process.env.OPENCLAW_HIDE_BANNER;
     loggingState.forceConsoleToStderr = false;
+  });
+
+  it("does not load inactive provider cleanup modules for cold help", async () => {
+    tryRouteCliMock.mockResolvedValueOnce(false);
+    const parseAsync = vi.fn().mockResolvedValueOnce(undefined);
+    buildProgramMock.mockReturnValueOnce({
+      commands: [{ name: () => "nodes", aliases: () => [] }],
+      parseAsync,
+    });
+
+    await withEnvAsync({ OPENCLAW_DISABLE_CLI_STARTUP_HELP_FAST_PATH: "1" }, async () => {
+      await runCli(["node", "openclaw", "nodes", "--help"]);
+    });
+
+    expect(parseAsync).toHaveBeenCalledWith(["node", "openclaw", "nodes", "--help"]);
+    expect(providerCleanupModuleImportState).toEqual({ local: 0, transport: 0 });
   });
 
   it("does not import dotenv for gateway forms without a workspace file", async () => {
@@ -656,8 +699,16 @@ describe("runCli exit behavior", () => {
   it("completes asynchronous teardown before returning to the outer entrypoint", async () => {
     const order: string[] = [];
     listRegisteredAgentHarnessesMock.mockReturnValueOnce([{ harness: { id: "copilot" } }]);
+    hasManagedProviderLocalServicesMock.mockReturnValueOnce(true);
+    hasProviderTransportDispatcherPoolMock.mockReturnValueOnce(true);
     disposeRegisteredAgentHarnessesMock.mockImplementationOnce(async () => {
       order.push("harnesses");
+    });
+    stopManagedProviderLocalServicesMock.mockImplementationOnce(() => {
+      order.push("provider-local-services");
+    });
+    closeProviderTransportDispatcherPoolMock.mockImplementationOnce(async () => {
+      order.push("provider-transport-dispatchers");
     });
     getActiveMcpLoopbackRuntimeMock.mockReturnValueOnce({ port: 1234 });
     closeMcpLoopbackServerMock.mockImplementationOnce(async () => {
@@ -671,7 +722,13 @@ describe("runCli exit behavior", () => {
 
     await runCli(["node", "openclaw", "models", "status", "--probe"]);
 
-    expect(order).toEqual(["harnesses", "mcp-loopback", "memory"]);
+    expect(order).toEqual([
+      "harnesses",
+      "provider-local-services",
+      "provider-transport-dispatchers",
+      "mcp-loopback",
+      "memory",
+    ]);
     expect(flushExitAfterOneShotOutputMock).not.toHaveBeenCalled();
   });
 
@@ -2705,6 +2762,159 @@ describe("runCli exit behavior", () => {
     expect(tryRouteCliMock).not.toHaveBeenCalled();
     expect(buildProgramMock).not.toHaveBeenCalled();
     expect(registerPluginCliCommandsFromValidatedConfigMock).not.toHaveBeenCalled();
+  });
+
+  it("routes a bare-root Control UI URL directly to the TUI action", async () => {
+    const target = "https://gateway.example/dashboard/main/movies-a1166b81";
+
+    await withInteractiveTty(() => runCli(["node", "openclaw", target]));
+
+    expect(runTuiCliActionMock).toHaveBeenCalledWith(target, {});
+    expect(buildProgramMock).not.toHaveBeenCalled();
+    expect(tryRouteCliMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["tui", "attach", "logs"])(
+    "leaves an explicit %s URL invocation on the Commander path",
+    async (command) => {
+      const target = "https://gateway.example/dashboard/main/movies-a1166b81";
+      const argv = ["node", "openclaw", command, target];
+      buildProgramMock.mockReturnValueOnce({
+        commands: [{ name: () => command, aliases: () => [] }],
+        parseAsync: commanderParseAsyncMock,
+      });
+
+      await runCli(argv);
+
+      expect(runTuiCliActionMock).not.toHaveBeenCalled();
+      expect(buildProgramMock).toHaveBeenCalledTimes(1);
+      expect(commanderParseAsyncMock).toHaveBeenCalledWith(argv);
+    },
+  );
+
+  it("leaves plugin-owned URL arguments on the plugin command path", async () => {
+    const target = "https://gateway.example/dashboard/main/movies-a1166b81";
+    const argv = ["node", "openclaw", "googlemeet", target];
+    buildProgramMock.mockReturnValueOnce({ commands: [], parseAsync: commanderParseAsyncMock });
+
+    await runCli(argv);
+
+    expect(runTuiCliActionMock).not.toHaveBeenCalled();
+    expect(buildProgramMock).toHaveBeenCalledTimes(1);
+    expect(commanderParseAsyncMock).toHaveBeenCalledWith(argv);
+  });
+
+  it("does not steal a URL argument from an unowned command", async () => {
+    const target = "https://gateway.example/dashboard/main/movies-a1166b81";
+
+    await expect(runCli(["node", "openclaw", "unknown-owner", target])).rejects.toThrow(
+      "Unknown command: openclaw unknown-owner",
+    );
+
+    expect(runTuiCliActionMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: "after the URL",
+      args: [
+        "https://gateway.example/dashboard/main/movies-a1166b81",
+        "--token",
+        "direct-token",
+        "--password=direct-password",
+        "--tls-fingerprint",
+        "sha256:direct",
+        "--deliver",
+        "--message",
+        "continue here",
+      ],
+    },
+    {
+      label: "before the URL with split values",
+      args: [
+        "--token",
+        "direct-token",
+        "--password",
+        "direct-password",
+        "--tls-fingerprint",
+        "sha256:direct",
+        "https://gateway.example/dashboard/main/movies-a1166b81",
+        "--deliver",
+        "--message",
+        "continue here",
+      ],
+    },
+    {
+      label: "before the URL with inline values",
+      args: [
+        "--token=direct-token",
+        "--password=direct-password",
+        "--tls-fingerprint=sha256:direct",
+        "--message=continue here",
+        "https://gateway.example/dashboard/main/movies-a1166b81",
+        "--deliver",
+      ],
+    },
+  ])("forwards bare-root TUI options $label without an environment handoff", async ({ args }) => {
+    const target = "https://gateway.example/dashboard/main/movies-a1166b81";
+    await withEnvAsync(
+      {
+        OPENCLAW_GATEWAY_TOKEN: "ambient-token",
+        OPENCLAW_GATEWAY_PASSWORD: "ambient-password",
+      },
+      () => withInteractiveTty(() => runCli(["node", "openclaw", ...args])),
+    );
+
+    expect(runTuiCliActionMock).toHaveBeenCalledWith(target, {
+      token: "direct-token",
+      password: "direct-password",
+      tlsFingerprint: "sha256:direct",
+      deliver: true,
+      message: "continue here",
+    });
+  });
+
+  it.each([
+    ["unknown inline option", ["--typo=do-not-print-me"]],
+    ["unknown split option", ["--typo", "do-not-print-me"]],
+    ["option terminator", ["--"]],
+  ])("rejects a pre-URL %s without reflecting values", async (_label, prefix) => {
+    const target = "https://gateway.example/dashboard/main/movies-a1166b81";
+    let error: unknown;
+    try {
+      await runCli(["node", "openclaw", ...prefix, target]);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).not.toContain("do-not-print-me");
+    expect(runTuiCliActionMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a missing pre-URL direct option value before command discovery", async () => {
+    const target = "https://gateway.example/dashboard/main/movies-a1166b81";
+
+    await expect(runCli(["node", "openclaw", "--token", target])).rejects.toThrow(
+      "--token requires a value",
+    );
+    expect(runTuiCliActionMock).not.toHaveBeenCalled();
+  });
+
+  it("does not claim a bare session ref as root-command sugar", async () => {
+    await expect(runCli(["node", "openclaw", "movies-a1166b81"])).rejects.toThrow(
+      "Unknown command: openclaw movies-a1166b81",
+    );
+
+    expect(runTuiCliActionMock).not.toHaveBeenCalled();
+  });
+
+  it("does not claim host shorthand as root-command sugar", async () => {
+    await expect(runCli(["node", "openclaw", "gateway.example/main/a1166b81"])).rejects.toThrow(
+      "Unknown command: openclaw gateway.example/main/a1166b81",
+    );
+
+    expect(runTuiCliActionMock).not.toHaveBeenCalled();
   });
 
   it("suggests close known commands for unowned command roots before proxy startup", async () => {

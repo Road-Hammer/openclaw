@@ -11,7 +11,7 @@ import {
 import type { ProgramContext } from "./context.js";
 import {
   getCoreCliCommandDescriptors,
-  getCoreCliCommandNames as getCoreDescriptorNames,
+  getCoreCliCommandNamesCore,
 } from "./core-command-descriptors.js";
 import {
   registerCommandGroupByName,
@@ -115,6 +115,11 @@ const coreEntrySpecs: readonly CommandGroupDescriptorSpec<
         loadModule: () => import("./register.transcripts.js"),
         exportName: "registerTranscriptsCli",
       },
+      {
+        commandNames: ["delivery"],
+        loadModule: () => import("./register.delivery.js"),
+        exportName: "registerDeliveryCommand",
+      },
     ]),
   ),
   defineImportedCommandGroupSpec(
@@ -136,7 +141,7 @@ const coreEntrySpecs: readonly CommandGroupDescriptorSpec<
   ...withProgramOnlySpecs(
     defineImportedProgramCommandGroupSpecs([
       {
-        commandNames: ["status", "health", "sessions", "commitments", "tasks"],
+        commandNames: ["status", "health", "sessions", "tasks"],
         loadModule: () => import("./register.status-health-sessions.js"),
         exportName: "registerStatusHealthSessionsCommands",
       },
@@ -157,7 +162,7 @@ function resolveCoreCommandGroups(ctx: ProgramContext, argv: string[]): CommandG
 }
 
 export function getCoreCliCommandNames(): string[] {
-  return getCoreDescriptorNames();
+  return getCoreCliCommandNamesCore();
 }
 
 export async function registerCoreCliByName(

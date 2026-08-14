@@ -1,3 +1,4 @@
+import { noteBackupDoctorHint } from "../commands/backup-health.js";
 import { isLegacyParentWritableUpdateDoctorPass } from "../commands/doctor/shared/update-phase.js";
 import { writeConfigMachineState } from "../state/config-machine-state.js";
 import type { DoctorHealthFlowContext } from "./doctor-health-contribution-types.js";
@@ -95,11 +96,17 @@ export async function runChannelIngressDeadLettersHealth(): Promise<void> {
   noteChannelIngressDeadLetters();
 }
 
+export async function runDeliveryFailuresHealth(): Promise<void> {
+  const { noteDeliveryFailures } = await import("../commands/doctor-delivery-failures.js");
+  noteDeliveryFailures();
+}
+
 export async function runStateIntegrityHealth(ctx: DoctorHealthFlowContext): Promise<void> {
   const { noteStateIntegrity } = await loadDoctorStateIntegrityModule();
   await noteStateIntegrity(ctx.cfg, ctx.prompter, ctx.configPath, {
     stateDirExistedAtStart: ctx.stateDirExistedAtStart,
   });
+  noteBackupDoctorHint(ctx.env ?? process.env);
 }
 
 export async function runCodexSessionRouteHealth(ctx: DoctorHealthFlowContext): Promise<void> {
@@ -123,15 +130,6 @@ export async function runCodexSessionRouteHealth(ctx: DoctorHealthFlowContext): 
   if (result.warnings.length > 0) {
     note(result.warnings.join("\n"), "Doctor warnings");
   }
-}
-
-export async function runSessionLocksHealth(ctx: DoctorHealthFlowContext): Promise<void> {
-  const { noteSessionLockHealth } = await import("../commands/doctor-session-locks.js");
-  await noteSessionLockHealth({
-    shouldRepair: ctx.prompter.shouldRepair,
-    config: ctx.cfg,
-    env: ctx.env,
-  });
 }
 
 export async function runSessionTranscriptsHealth(ctx: DoctorHealthFlowContext): Promise<void> {

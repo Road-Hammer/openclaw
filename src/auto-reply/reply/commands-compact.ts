@@ -26,7 +26,7 @@ import {
   resolveSessionRuntimeOverrideForProvider,
 } from "../../agents/session-runtime-compat.js";
 import { resolveSessionAuthProfileOverrideSource } from "../../config/sessions/auth-profile-override-provenance.js";
-import { resolveStorePath } from "../../config/sessions/paths.js";
+import { resolveSessionStorePathCore } from "../../config/sessions/paths.js";
 import { resolveSessionStorePathForScope } from "../../config/sessions/session-store-path.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { logVerbose } from "../../globals.js";
@@ -256,7 +256,8 @@ export const handleCompactCommand: CommandHandler = async (params) => {
     agentId: sessionAgentId,
     sessionKey: params.sessionKey,
     storePath:
-      params.storePath ?? resolveStorePath(params.cfg.session?.store, { agentId: sessionAgentId }),
+      params.storePath ??
+      resolveSessionStorePathCore(params.cfg.session?.store, { agentId: sessionAgentId }),
   });
   const result = await runtime.compactEmbeddedAgentSession({
     abortSignal: params.opts?.abortSignal,
@@ -334,12 +335,11 @@ export const handleCompactCommand: CommandHandler = async (params) => {
       sessionStore: params.sessionStore,
       sessionKey: params.sessionKey,
       storePath: compactionStorePath,
-      // Update token counts after compaction
       tokensAfter: result.result?.tokensAfter,
       newSessionId: result.result?.sessionId,
+      compactionKind: result.compactionKind,
     });
   }
-  // Use the post-compaction token count for context summary if available
   const totalTokens = didCompact
     ? tokensAfterCompaction
     : runtime.resolveFreshSessionTotalTokens(targetSessionEntry);

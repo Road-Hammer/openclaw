@@ -15,7 +15,8 @@ export {
 } from "./delivery-queue-platform-lease.js";
 export type { QueuedReplyPayloadSendingHook } from "./delivery-queue-storage.js";
 export {
-  drainPendingDeliveries,
+  drainPendingDeliveriesCore,
+  reconcileOutboundFailedDeliveryFinalizations,
   recoverPendingDeliveries,
   withActiveDeliveryClaim,
 } from "./delivery-queue-recovery.js";

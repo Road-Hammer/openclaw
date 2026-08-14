@@ -11,6 +11,7 @@ import type { InlineConfig, Plugin, PreviewServer, ViteDevServer } from "vite";
 import { PROTOCOL_VERSION } from "../../../packages/gateway-protocol/src/version.js";
 import { CONTROL_UI_BOOTSTRAP_CONFIG_PATH } from "../../../src/gateway/control-ui-contract.js";
 import type { ModelCatalogEntry } from "../api/types.ts";
+import { normalizeControlUiBuildInfo } from "../build-info-normalizers.ts";
 import type { ControlUiBuildInfo } from "../build-info.ts";
 
 export function controlUiSessionPath(sessionKey: string, basePath = ""): string {
@@ -30,6 +31,32 @@ export function controlUiSessionUrl(baseUrl: string, sessionKey: string): string
   url.search = "";
   url.hash = "";
   return url.toString();
+}
+
+export async function navigateToControlUiSession(page: Page, sessionKey: string): Promise<void> {
+  await page.evaluate((pathname) => {
+    const app = document.querySelector("openclaw-app") as HTMLElement & {
+      runtime?: {
+        context: {
+          navigate: (routeId: string, options: { pathname: string }) => void;
+        };
+      };
+    };
+    if (!app.runtime) {
+      throw new Error("OpenClaw application runtime is unavailable");
+    }
+    app.runtime.context.navigate("chat", { pathname });
+  }, controlUiSessionPath(sessionKey));
+  await page.waitForURL((url) => url.pathname === controlUiSessionPath(sessionKey));
+  await page.waitForFunction(
+    (targetSessionKey) =>
+      [...document.querySelectorAll<HTMLElement>("openclaw-chat-pane")].some(
+        (pane) =>
+          pane.classList.contains("chat-pane-cache__pane--visible") &&
+          (pane as HTMLElement & { sessionKey?: string }).sessionKey === targetSessionKey,
+      ),
+    sessionKey,
+  );
 }
 
 export function controlUiBundledGatewayUrl(baseUrl: string): string {
@@ -114,6 +141,22 @@ export async function waitForControlUiRoute(page: Page, target: ControlUiRouteTa
   }
 }
 
+/**
+ * Wait for the settled in-app confirmation modal. Control UI routes destructive
+ * confirms through `showConfirmDialog`, so no native browser dialog ever fires;
+ * waiting for full opacity keeps the click from landing mid-animation.
+ */
+export async function waitForConfirmModal(page: Page): Promise<Locator> {
+  await page.waitForFunction(() => {
+    const modal = [...document.querySelectorAll("openclaw-modal-dialog")].at(-1);
+    const dialog = modal?.shadowRoot
+      ?.querySelector("wa-dialog")
+      ?.shadowRoot?.querySelector("dialog");
+    return Boolean(dialog) && getComputedStyle(dialog as Element).opacity === "1";
+  });
+  return page.locator("openclaw-modal-dialog").last();
+}
+
 export async function waitForControlUiSettingsTakeover(
   page: Page,
   pathname = "/settings/appearance",
@@ -155,6 +198,8 @@ const defaultControlUiFeatureMethods = [
   "config.apply",
   "config.patch",
   "config.set",
+  "device.scopes.requestUpgrade",
+  "device.scopes.waitUpgrade",
   "session.members.add",
   "session.members.list",
   "session.members.remove",
@@ -221,6 +266,8 @@ export type ControlUiMockGatewayScenario = {
   historyMessages?: unknown[];
   /** Static payloads, parameter-matched cases, or call-ordered sequences. */
   methodResponses?: Record<string, unknown>;
+  /** URL prefixes that retain the browser's real WebSocket transport. */
+  webSocketPassthroughPrefixes?: string[];
   /** Replayed in-flight run snapshot served by chat.history and chat.startup. */
   inFlightRun?: {
     runId: string;
@@ -292,7 +339,7 @@ export function setSharedControlUiE2eServerBaseUrl(baseUrl: string | null): void
 export type MockGatewayControls = {
   closeLatest: (code?: number, reason?: string) => Promise<void>;
   deliverLatest: (frame: unknown) => Promise<void>;
-  deferNext: (method: string) => Promise<void>;
+  deferNext: (method: string, match?: Record<string, unknown>) => Promise<void>;
   emitChatFinal: (params: { runId: string; sessionKey?: string; text: string }) => Promise<void>;
   emitGatewayEvent: (event: string, payload?: unknown) => Promise<void>;
   getRequests: (method?: string) => Promise<MockGatewayRequest[]>;
@@ -379,7 +426,9 @@ export async function startControlUiE2eServer(
       close: async () => {},
     };
   }
-  const resolvedBuildInfo = buildInfo ?? DEFAULT_CONTROL_UI_E2E_BUILD_INFO;
+  const resolvedBuildInfo = normalizeControlUiBuildInfo(
+    buildInfo ?? DEFAULT_CONTROL_UI_E2E_BUILD_INFO,
+  );
   // Shared browser fixtures import this helper; load filesystem-bound Vite
   // configuration only when its Node-owned development server actually starts.
   const [
@@ -639,6 +688,7 @@ function normalizeScenario(
     omitFeatureMethods: scenario.omitFeatureMethods ?? false,
     historyMessages: scenario.historyMessages ?? [],
     methodResponses: scenario.methodResponses ?? {},
+    webSocketPassthroughPrefixes: scenario.webSocketPassthroughPrefixes ?? [],
     inFlightRun: scenario.inFlightRun ?? null,
     presenceUsers: scenario.presenceUsers ?? [],
     models: scenario.models ?? [{ id: "gpt-5.5", name: "gpt-5.5", provider: "openai" }],
@@ -695,6 +745,7 @@ function installControlUiMockGateway(
   },
   parseJson5: (raw: string) => unknown,
 ) {
+  const NativeWebSocket = window.WebSocket;
   type BrowserRequest = { id: string; method: string; params?: unknown };
   type BrowserFrame = {
     id?: unknown;
@@ -719,10 +770,14 @@ function installControlUiMockGateway(
     params?: unknown;
     socket: { deliver: (frame: unknown) => void };
   };
+  type DeferredMethod = {
+    method: string;
+    match?: Record<string, unknown>;
+  };
   type ExposedGateway = {
     closeLatest: (code?: number, reason?: string) => void;
     deliverLatest: (frame: unknown) => void;
-    deferNext: (method: string) => void;
+    deferNext: (method: string, match?: Record<string, unknown>) => void;
     emit: (event: string, payload?: unknown) => void;
     findRequests: (method?: string) => BrowserRequest[];
     rejectDeferred: (
@@ -762,7 +817,7 @@ function installControlUiMockGateway(
   } catch {
     // Opaque initial documents may not expose storage; the target page will.
   }
-  const deferredMethods: string[] = [...scenario.deferredMethods];
+  const deferredMethods: DeferredMethod[] = scenario.deferredMethods.map((method) => ({ method }));
   const deferredResponses: DeferredResponse[] = [];
   const requests: BrowserRequest[] = [];
   const methodResponseSequenceIndexes = new Map<string, number>();
@@ -906,6 +961,8 @@ function installControlUiMockGateway(
     return names;
   }
 
+  // This function is serialized with installControlUiMockGateway.toString().
+  // Keep the guard local so the generated script captures no module imports.
   function isRecord(value: unknown): value is Record<string, unknown> {
     return Boolean(value) && typeof value === "object" && !Array.isArray(value);
   }
@@ -1384,10 +1441,16 @@ function installControlUiMockGateway(
         : configuredValue;
     }
     switch (method) {
-      case "connect":
+      case "connect": {
+        const auth = isRecord(params) && isRecord(params.auth) ? params.auth : null;
+        const connectedDeviceToken =
+          auth && typeof auth.deviceToken === "string" ? auth.deviceToken : scenario.deviceToken;
         return {
           auth: {
-            ...(deviceAuthMigrationPending ? {} : { deviceToken: scenario.deviceToken }),
+            ...(deviceAuthMigrationPending
+              ? {}
+              : { deviceToken: connectedDeviceToken, recoveryMigrationAllowed: true as const }),
+            recoveryScope: "e2e-recovery-scope",
             role: "operator",
             scopes: scenario.operatorScopes,
           },
@@ -1421,6 +1484,7 @@ function installControlUiMockGateway(
           },
           type: "hello-ok",
         };
+      }
       case "agent.identity.get":
         return {
           agentId: scenario.assistantAgentId,
@@ -1627,8 +1691,10 @@ function installControlUiMockGateway(
     }
   }
 
-  function shouldDefer(method: string): boolean {
-    const index = deferredMethods.indexOf(method);
+  function shouldDefer(method: string, params: unknown): boolean {
+    const index = deferredMethods.findIndex(
+      (candidate) => candidate.method === method && paramsMatch(params, candidate.match),
+    );
     if (index < 0) {
       return false;
     }
@@ -1729,7 +1795,7 @@ function installControlUiMockGateway(
         return;
       }
       requests.push({ id, method, params: frame.params });
-      if (shouldDefer(method)) {
+      if (shouldDefer(method, frame.params)) {
         deferredResponses.push({ id, method, params: frame.params, socket: this });
         return;
       }
@@ -1785,8 +1851,8 @@ function installControlUiMockGateway(
     deliverLatest(frame) {
       MockWebSocket.latest?.deliver(frame);
     },
-    deferNext(method) {
-      deferredMethods.push(method);
+    deferNext(method, match) {
+      deferredMethods.push({ method, match });
     },
     emit(event, payload) {
       MockWebSocket.latest?.deliver({
@@ -1900,7 +1966,23 @@ function installControlUiMockGateway(
   };
 
   (window as unknown as WindowWithGateway).openclawControlUiE2eGateway = exposed;
-  window.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+  const RoutedWebSocket = function (url: string | URL, protocols?: string | string[]) {
+    const resolvedUrl = String(url);
+    if (scenario.webSocketPassthroughPrefixes.some((prefix) => resolvedUrl.startsWith(prefix))) {
+      return protocols === undefined
+        ? new NativeWebSocket(resolvedUrl)
+        : new NativeWebSocket(resolvedUrl, protocols);
+    }
+    return new MockWebSocket(resolvedUrl);
+  };
+  RoutedWebSocket.prototype = MockWebSocket.prototype;
+  Object.assign(RoutedWebSocket, {
+    CLOSED: MockWebSocket.CLOSED,
+    CLOSING: MockWebSocket.CLOSING,
+    CONNECTING: MockWebSocket.CONNECTING,
+    OPEN: MockWebSocket.OPEN,
+  });
+  window.WebSocket = RoutedWebSocket as unknown as typeof WebSocket;
   window.addEventListener("pagehide", () => {
     sessionMessageSubscriptions.clear();
     stopRepeatingSessionEvents();
@@ -1991,20 +2073,23 @@ function createMockGatewayControls(page: Page, defaultSessionKey: string): MockG
       );
     },
     deliverLatest,
-    async deferNext(method) {
-      await page.evaluate((targetMethod) => {
-        const gateway = (
-          window as Window & {
-            openclawControlUiE2eGateway?: {
-              deferNext: (method: string) => void;
-            };
+    async deferNext(method, match) {
+      await page.evaluate(
+        ({ targetMethod, requestMatch }) => {
+          const gateway = (
+            window as Window & {
+              openclawControlUiE2eGateway?: {
+                deferNext: (method: string, match?: Record<string, unknown>) => void;
+              };
+            }
+          ).openclawControlUiE2eGateway;
+          if (!gateway) {
+            throw new Error("Mock Gateway is not installed");
           }
-        ).openclawControlUiE2eGateway;
-        if (!gateway) {
-          throw new Error("Mock Gateway is not installed");
-        }
-        gateway.deferNext(targetMethod);
-      }, method);
+          gateway.deferNext(targetMethod, requestMatch);
+        },
+        { targetMethod: method, requestMatch: match },
+      );
     },
     async emitChatFinal(params) {
       await emitGatewayEvent("chat", {

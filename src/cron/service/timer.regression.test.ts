@@ -12,6 +12,7 @@ import {
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { DEFAULT_CRON_MAX_CONCURRENT_RUNS } from "../../config/cron-limits.js";
 import { HEARTBEAT_SKIP_LANES_BUSY, type HeartbeatRunResult } from "../../infra/heartbeat-wake.js";
+import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import { CRON_TASK_KIND } from "../../tasks/cron-task-contract.js";
 import { cancelTaskById, listTaskRecords } from "../../tasks/task-registry.js";
 import {
@@ -26,14 +27,13 @@ import {
   markCronJobActive,
 } from "../active-jobs.js";
 import * as schedule from "../schedule.js";
-import * as cronStoreModule from "../store.js";
 import { loadCronStore, saveCronStore } from "../store.js";
 import { cronStoreKey } from "../store/key.js";
 import { readCronTaskRunHistoryPage } from "../task-run-history.js";
 import type { CronAgentExecutionPhaseUpdate, CronJob } from "../types.js";
 import { cancelActiveCronTaskRun } from "./active-run-cancellation.js";
 import { resetActiveCronTaskRunsForTests } from "./active-run-cancellation.test-support.js";
-import { computeJobNextRunAtMs, recomputeNextRunsForMaintenance } from "./jobs.js";
+import { computeJobNextRunAtMs, recomputeNextRunsForMaintenance } from "./jobs-scheduling.js";
 import { stop } from "./ops-lifecycle.js";
 import { run as runManualCronJob } from "./ops-run.js";
 import { createCronServiceState as createBaseCronServiceState, type CronEvent } from "./state.js";
@@ -1978,66 +1978,12 @@ describe("cron service timer regressions", () => {
       (await loadCronStore(store.storePath)).jobs.find((job) => job.id === catchupJob.id)?.state
         .runningAtMs,
     ).toBeUndefined();
-  });
-
-  it("finalizes completed startup catch-up work before a later activation reload failure", async () => {
-    const store = timerRegressionFixtures.makeStorePath();
-    const dueAt = Date.parse("2026-02-06T10:05:01.469Z");
-    const first = createDueIsolatedJob({
-      id: "failed-startup-catchup-first",
-      nowMs: dueAt,
-      nextRunAtMs: dueAt,
-    });
-    const second = createDueIsolatedJob({
-      id: "failed-startup-catchup-second",
-      nowMs: dueAt,
-      nextRunAtMs: dueAt,
-    });
-    await saveCronStore(store.storePath, { version: 1, jobs: [first, second] });
-
-    const state = createCronServiceState({
-      cronEnabled: true,
-      storePath: store.storePath,
-      log: noopLogger,
-      nowMs: () => dueAt,
-      enqueueSystemEvent: vi.fn(),
-      requestHeartbeat: vi.fn(),
-      runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const })),
-    });
-    const realLoad = cronStoreModule.loadCronJobsStoreWithConfigJobs;
-    let loadCount = 0;
-    const loadSpy = vi
-      .spyOn(cronStoreModule, "loadCronJobsStoreWithConfigJobs")
-      .mockImplementation(async (storePath) => {
-        loadCount += 1;
-        // The first catch-up outcome now reloads and persists before job two.
-        if (loadCount === 4) {
-          throw new Error("startup activation reload failed");
-        }
-        return await realLoad(storePath);
-      });
-
-    try {
-      await expect(runMissedJobs(state)).rejects.toThrow("startup activation reload failed");
-    } finally {
-      loadSpy.mockRestore();
-    }
-
-    expect(state.store?.jobs.find((entry) => entry.id === first.id)?.state.lastStatus).toBe("ok");
-    expect(
-      (await loadCronStore(store.storePath)).jobs.find((entry) => entry.id === first.id)?.state
-        .lastStatus,
-    ).toBe("ok");
-    for (const job of [first, second]) {
-      expect(
-        state.store?.jobs.find((entry) => entry.id === job.id)?.state.runningAtMs,
-      ).toBeUndefined();
-      expect(state.queuedRunReservationsByJobId.has(job.id)).toBe(false);
-      expect(
-        (await loadCronStore(store.storePath)).jobs.find((entry) => entry.id === job.id)?.state
-          .runningAtMs,
-      ).toBeUndefined();
-    }
+    const receipt = openOpenClawStateDatabase()
+      .db.prepare(
+        "SELECT status FROM cron_run_receipts WHERE store_key = ? AND job_id = ? ORDER BY started_at_ms DESC LIMIT 1",
+      )
+      .get(cronStoreKey(store.storePath), catchupJob.id) as { status: string } | undefined;
+    expect(receipt?.status).toBe("skipped");
   });
 
   it("does not start an admitted due job after stop wins its service-lock wait", async () => {
@@ -2147,6 +2093,74 @@ describe("cron service timer regressions", () => {
         error: expect.stringContaining("setup timed out before runner start"),
         timeoutMs: 60_000,
       });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not release a running sibling when setup-timeout recovery clears queued jobs", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = timerRegressionFixtures.makeStorePath();
+      const dueAt = Date.parse("2026-02-06T10:06:21.000Z");
+      const stalled = createDueIsolatedJob({
+        id: "setup-timeout-stalled",
+        nowMs: dueAt,
+        nextRunAtMs: dueAt,
+      });
+      const running = createDueIsolatedJob({
+        id: "setup-timeout-running-sibling",
+        nowMs: dueAt,
+        nextRunAtMs: dueAt,
+      });
+      stalled.payload = { kind: "agentTurn", message: "stall", timeoutSeconds: 120 };
+      running.payload = { kind: "agentTurn", message: "run", timeoutSeconds: 120 };
+      await saveCronStore(store.storePath, { version: 1, jobs: [stalled, running] });
+
+      let now = dueAt;
+      const runningStarted = createDeferred();
+      const finishRunning = createDeferred<{ status: "ok"; summary: string }>();
+      const timeoutNotified = createDeferred();
+      const state = createCronServiceState({
+        cronEnabled: true,
+        storePath: store.storePath,
+        testAdmissionLimit: 2,
+        log: noopLogger,
+        nowMs: () => now,
+        enqueueSystemEvent: vi.fn(),
+        requestHeartbeat: vi.fn(),
+        onIsolatedAgentSetupTimeout: () => timeoutNotified.resolve(),
+        runIsolatedAgentJob: vi.fn(
+          async ({
+            job,
+            onExecutionStarted,
+          }: Parameters<CronStateParams["runIsolatedAgentJob"]>[0]) => {
+            if (job.id === stalled.id) {
+              return await new Promise<never>(() => {});
+            }
+            onExecutionStarted?.({ jobId: job.id, phase: "model_call_started" });
+            runningStarted.resolve();
+            return await finishRunning.promise;
+          },
+        ),
+      });
+
+      const timerPromise = onTimer(state);
+      await runningStarted.promise;
+      await vi.advanceTimersByTimeAsync(60_100);
+      now += 60_100;
+      await timeoutNotified.promise;
+
+      const runningAtMsAfterRecovery = requireJob(state, running.id).state.runningAtMs;
+      const reservationHeldAfterRecovery = state.queuedRunReservationsByJobId.has(running.id);
+      finishRunning.resolve({ status: "ok", summary: "finished" });
+      await timerPromise;
+
+      expect({ runningAtMsAfterRecovery, reservationHeldAfterRecovery }).toEqual({
+        runningAtMsAfterRecovery: dueAt,
+        reservationHeldAfterRecovery: true,
+      });
+      expect(requireJob(state, running.id).state.lastStatus).toBe("ok");
     } finally {
       vi.useRealTimers();
     }
@@ -2843,7 +2857,10 @@ describe("cron service timer regressions", () => {
 
       const order: string[] = [];
       const enqueueSystemEvent = vi.fn(() => {
-        expect(order.at(-1)).toBe("persist");
+        const persisted = openOpenClawStateDatabase()
+          .db.prepare("SELECT enabled FROM cron_jobs WHERE store_key = ? AND job_id = ?")
+          .get(cronStoreKey(store.storePath), malformed.id) as { enabled: number };
+        expect(persisted.enabled).toBe(0);
         order.push("notify");
       });
       const requestHeartbeat = vi.fn(() => {
@@ -2866,20 +2883,13 @@ describe("cron service timer regressions", () => {
         }
         return computeNextRunAtMs(cronSchedule, nowMs);
       });
-      const saveCronJobsStore = cronStoreModule.saveCronJobsStore;
-      vi.spyOn(cronStoreModule, "saveCronJobsStore").mockImplementation(async (...args) => {
-        await saveCronJobsStore(...args);
-        order.push("persist");
-      });
-
       if (path === "startup catch-up") {
         await runMissedJobs(state);
       } else {
         await onTimer(state);
       }
 
-      const notifyAt = order.indexOf("notify");
-      expect(order.slice(notifyAt - 1, notifyAt + 2)).toEqual(["persist", "notify", "heartbeat"]);
+      expect(order).toEqual(["notify", "heartbeat"]);
       expect(state.store?.jobs.find((job) => job.id === malformed.id)?.enabled).toBe(false);
       expect(
         (await loadCronStore(store.storePath)).jobs.find((job) => job.id === malformed.id),

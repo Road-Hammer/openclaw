@@ -14,6 +14,11 @@ import { Type } from "typebox";
 import { parseScreenSnapshotPayload } from "../../cli/nodes-screen.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { formatErrorMessage } from "../../infra/errors.js";
+import type {
+  ComputerActParams,
+  ScreenSnapshotParams,
+} from "../../plugins/computer-use-contract.js";
+import { sleep } from "../../utils/sleep.js";
 import {
   DEFAULT_IMAGE_MAX_DIMENSION_PX,
   resolveImageSanitizationLimits,
@@ -27,12 +32,11 @@ import {
   stringEnum,
 } from "../schema/typebox.js";
 import { sanitizeToolResultImages } from "../tool-images.js";
-import { sleep } from "../utils/sleep.js";
 import {
   type AnyAgentTool,
   readFiniteNumberParam,
   readPositiveIntegerParam,
-  readStringParam,
+  readToolStringParam,
 } from "./common.js";
 import { gatewayCallOptionSchemaProperties } from "./gateway-schema.js";
 import { callGatewayTool, type GatewayCallOptions, readGatewayCallOptions } from "./gateway.js";
@@ -77,7 +81,7 @@ const COMPUTER_TOOL_ACTIONS = [
 
 type ComputerToolAction = (typeof COMPUTER_TOOL_ACTIONS)[number];
 
-const INPUT_ACTIONS = new Set<ComputerToolAction>([
+const INPUT_ACTIONS = new Set<ComputerActParams["action"]>([
   "left_click",
   "right_click",
   "middle_click",
@@ -92,6 +96,10 @@ const INPUT_ACTIONS = new Set<ComputerToolAction>([
   "key",
   "hold_key",
 ]);
+
+function isComputerActAction(action: ComputerToolAction): action is ComputerActParams["action"] {
+  return INPUT_ACTIONS.has(action as ComputerActParams["action"]);
+}
 
 const COORDINATE_REQUIRED_ACTIONS = new Set<ComputerToolAction>([
   "left_click",
@@ -125,6 +133,12 @@ const MODIFIER_TEXT_ACTIONS = new Set<ComputerToolAction>([
 ]);
 
 const SCROLL_DIRECTIONS = ["up", "down", "left", "right"] as const;
+
+function isScrollDirection(
+  value: string,
+): value is NonNullable<ComputerActParams["scrollDirection"]> {
+  return SCROLL_DIRECTIONS.some((direction) => direction === value);
+}
 
 const ComputerToolSchema = Type.Object({
   action: stringEnum(COMPUTER_TOOL_ACTIONS),
@@ -177,23 +191,6 @@ const ComputerToolSchema = Type.Object({
   ),
 });
 
-type ComputerActWireParams = {
-  action: string;
-  displayFrameId?: string;
-  x?: number;
-  y?: number;
-  fromX?: number;
-  fromY?: number;
-  text?: string;
-  keys?: string;
-  modifiers?: string;
-  scrollDirection?: string;
-  scrollAmount?: number;
-  durationMs?: number;
-  screenIndex?: number;
-  refWidth: number;
-};
-
 function readCoordinate(
   params: Record<string, unknown>,
   key: "coordinate" | "startCoordinate",
@@ -236,14 +233,14 @@ function readModifiers(params: Record<string, unknown>, action: ComputerToolActi
 
 /** Builds the computer.act wire params for one tool input action. */
 function buildComputerActParams(params: {
-  action: ComputerToolAction;
+  action: ComputerActParams["action"];
   input: Record<string, unknown>;
   screenIndex: number;
   displayFrameId?: string;
   refWidth?: number;
-}): ComputerActWireParams {
+}): ComputerActParams {
   const { action, input } = params;
-  const wire: ComputerActWireParams = {
+  const wire: ComputerActParams = {
     action,
     screenIndex: params.screenIndex,
     refWidth: params.refWidth ?? COMPUTER_REF_WIDTH,
@@ -278,7 +275,7 @@ function buildComputerActParams(params: {
     }
     case "scroll": {
       const direction = normalizeOptionalLowercaseString(input.scrollDirection);
-      if (!direction || !SCROLL_DIRECTIONS.includes(direction as never)) {
+      if (!direction || !isScrollDirection(direction)) {
         throw new Error("scrollDirection up|down|left|right required for scroll");
       }
       wire.scrollDirection = direction;
@@ -296,7 +293,7 @@ function buildComputerActParams(params: {
     }
     case "key":
     case "hold_key": {
-      const keys = readStringParam(input, "text", { required: true });
+      const keys = readToolStringParam(input, "text", { required: true });
       wire.keys = keys;
       if (action === "hold_key") {
         const seconds =
@@ -409,16 +406,17 @@ async function captureScreenshot(params: {
   refWidth: number;
   signal?: AbortSignal;
 }): Promise<ScreenshotCapture> {
+  const commandParams: ScreenSnapshotParams = {
+    screenIndex: params.screenIndex,
+    maxWidth: params.refWidth,
+    quality: SCREENSHOT_QUALITY,
+    format: "jpeg",
+  };
   const payload = await invokeNodeCommand({
     gatewayOpts: params.gatewayOpts,
     nodeId: params.nodeId,
     command: SCREEN_SNAPSHOT_COMMAND,
-    commandParams: {
-      screenIndex: params.screenIndex,
-      maxWidth: params.refWidth,
-      quality: SCREENSHOT_QUALITY,
-      format: "jpeg",
-    },
+    commandParams,
     signal: params.signal,
   });
   const parsed = parseScreenSnapshotPayload(payload);
@@ -655,7 +653,9 @@ export function createComputerTool(options?: {
       serialize(async () => {
         signal?.throwIfAborted();
         const params = args as Record<string, unknown>;
-        const action = readStringParam(params, "action", { required: true }) as ComputerToolAction;
+        const action = readToolStringParam(params, "action", {
+          required: true,
+        }) as ComputerToolAction;
         const gatewayOpts = readGatewayCallOptions(params);
         const explicitNode = typeof params.node === "string" ? params.node : undefined;
         const explicitScreenIndex = (() => {
@@ -859,8 +859,8 @@ export function createComputerTool(options?: {
             break;
         }
 
-        if (!INPUT_ACTIONS.has(action)) {
-          throw new Error(`Unknown action: ${action}`);
+        if (!isComputerActAction(action)) {
+          throw new Error(`Unknown action: ${String(action)}`);
         }
         const wireParams = buildComputerActParams({
           action,
