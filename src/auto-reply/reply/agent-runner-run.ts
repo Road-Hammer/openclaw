@@ -43,12 +43,16 @@ import { resolveActiveRunQueueAction } from "./queue-policy.js";
 import { enqueueFollowupRun, scheduleFollowupDrain } from "./queue.js";
 import { REPLY_ADMISSION_TICKET } from "./reply-admission-ticket.js";
 import { createReplyMediaContext } from "./reply-media-paths.js";
+import { isReplyOperationSuperseded } from "./reply-operation-abort.js";
 import { recordReplyOperationAgentTurn } from "./reply-operation-agent-turn-state.js";
 import * as replyRunState from "./reply-operation-run-state.js";
 import { type ReplyOperation, replyRunRegistry } from "./reply-run-registry.js";
 import { bindReplyOperationTyping } from "./reply-run-typing.js";
 import { createReplyToModeFilterForChannel, resolveReplyToMode } from "./reply-threading.js";
-import { resolveFollowupRunToolAuthorityFingerprint } from "./reply-tool-authority.js";
+import {
+  createFollowupRunToolAuthorityProjector,
+  resolveFollowupRunToolAuthorityFingerprint,
+} from "./reply-tool-authority.js";
 import { admitReplyTurn, resolveReplyTurnKind } from "./reply-turn-admission.js";
 import {
   isDuplicateRestartRecoverySource,
@@ -79,7 +83,6 @@ export async function runReplyAgent(
     runtimePolicySessionKey,
     storePath,
     defaultModel,
-    agentCfgContextTokens,
     resolvedVerboseLevel,
     toolProgressDetail,
     isNewSession,
@@ -245,7 +248,6 @@ export async function runReplyAgent(
     sessionKey,
     storePath,
     defaultModel,
-    agentCfgContextTokens,
     toolProgressDetail,
   });
 
@@ -373,12 +375,13 @@ export async function runReplyAgent(
   });
   const compactionNoticeMessageId = sessionCtx.MessageSidFull ?? sessionCtx.MessageSid;
   const sendDirectCompactionNotice = shouldNotifyUserAboutCompaction(cfg)
-    ? async (phase: CompactionNoticePhase) => {
+    ? async (phase: CompactionNoticePhase, text?: string) => {
         if (!opts?.onBlockReply) {
           return;
         }
         const noticePayload = createCompactionNoticePayload({
           phase,
+          text,
           currentMessageId: compactionNoticeMessageId,
           applyReplyToMode,
         });
@@ -431,7 +434,6 @@ export async function runReplyAgent(
       routeThreadId: replyRouteThreadId,
       originatingLeafEntryId: turnAdoptionLifecycle?.originatingLeafEntryId,
       upstreamAbortSignal: opts?.abortSignal,
-      onReplyAdmissionWaitChange: opts?.onReplyAdmissionWaitChange,
     });
     if (replyOperationRunState) {
       replyOperationRunState.admission =
@@ -477,7 +479,10 @@ export async function runReplyAgent(
       }
     }
   }
-  replyOperation.bindToolAuthorityFingerprint(incomingToolAuthorityFingerprint);
+  replyOperation.bindToolAuthorityProjector(createFollowupRunToolAuthorityProjector(followupRun));
+  replyOperation.bindToolAuthorityFingerprint(
+    resolveFollowupRunToolAuthorityFingerprint(followupRun),
+  );
   bindReplyOperationTyping(replyOperation, typing);
   let runFollowupTurn = queuedRunFollowupTurn;
   let shouldDrainQueuedFollowupsAfterClear = false;
@@ -549,7 +554,6 @@ export async function runReplyAgent(
     return await executePreparedReplyAgentRun({
       activeSessionStore,
       admitUserTurn,
-      agentCfgContextTokens,
       applyReplyToMode,
       beginBeforeAgentReply,
       blockReplyChunking,
@@ -603,7 +607,11 @@ export async function runReplyAgent(
       typingSignals,
     });
   } catch (error) {
-    recordReplyOperationAgentTurn(replyOperationRunState, "failed");
+    recordReplyOperationAgentTurn(
+      replyOperationRunState,
+      isReplyOperationSuperseded(replyOperation) ? "superseded" : "failed",
+      replyOperation,
+    );
     return await handleReplyAgentRunError(error, {
       blockReplyPipeline,
       cfg,

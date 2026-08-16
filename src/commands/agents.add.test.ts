@@ -22,6 +22,7 @@ const replaceConfigFileMock = vi.hoisted(() =>
   vi.fn(async (params: { nextConfig: unknown }) => await writeConfigFileMock(params.nextConfig)),
 );
 const createAgentMock = vi.hoisted(() => vi.fn());
+const checkAgentCreationGateMock = vi.hoisted(() => vi.fn());
 const commitConfigWithPendingPluginInstallsMock = vi.hoisted(() =>
   vi.fn(async (params: { nextConfig: Record<string, unknown> }) => {
     await writeConfigFileMock(params.nextConfig);
@@ -90,7 +91,13 @@ vi.mock("../config/config.js", async () => ({
   replaceConfigFile: replaceConfigFileMock,
 }));
 
-vi.mock("../agents/agent-create.js", () => ({ createAgent: createAgentMock }));
+vi.mock("../agents/agent-create.js", async () => ({
+  ...(await vi.importActual<typeof import("../agents/agent-create.js")>(
+    "../agents/agent-create.js",
+  )),
+  checkAgentCreationGate: checkAgentCreationGateMock,
+  createAgent: createAgentMock,
+}));
 
 vi.mock("../plugins/install-record-commit.js", async () => ({
   ...(await vi.importActual<typeof import("../plugins/install-record-commit.js")>(
@@ -142,10 +149,17 @@ describe("agents add command", () => {
     replaceConfigFileMock.mockClear();
     commitConfigWithPendingPluginInstallsMock.mockClear();
     transformConfigWithPendingPluginInstallsMock.mockClear();
+    checkAgentCreationGateMock.mockReset().mockResolvedValue(undefined);
     createAgentMock.mockReset();
     createAgentMock.mockImplementation(
-      async (params: { name: string; workspace: string; bindingSpecs?: string[] }) => {
-        const agentId = params.name.toLowerCase();
+      async (params: {
+        name?: string;
+        workspace?: string;
+        entry?: { id: string; name?: string; workspace?: string; agentDir?: string };
+        bindingSpecs?: string[];
+      }) => {
+        const name = params.name ?? params.entry?.name ?? params.entry?.id ?? "";
+        const agentId = (params.entry?.id ?? name).toLowerCase();
         if (agentId === "openclaw" || agentId === "crestodian") {
           return { status: "error", reason: "reserved-id", agentId };
         }
@@ -159,9 +173,9 @@ describe("agents add command", () => {
         return {
           status: "created" as const,
           agentId,
-          name: params.name,
-          workspace: params.workspace,
-          agentDir: `/tmp/agent-${agentId}`,
+          name,
+          workspace: params.workspace ?? params.entry?.workspace ?? `/tmp/workspace-${agentId}`,
+          agentDir: params.entry?.agentDir ?? `/tmp/agent-${agentId}`,
           bootstrapPending: true,
           ...(binding
             ? {
@@ -238,6 +252,33 @@ describe("agents add command", () => {
     },
   );
 
+  it("rejects an unrepresentable positional name before targeting an existing agent", async () => {
+    readConfigFileSnapshotMock.mockResolvedValue({
+      ...baseConfigSnapshot,
+      config: { agents: { entries: { main: {} } } },
+      sourceConfig: { agents: { entries: { main: {} } } },
+    });
+    const prompter = {
+      intro: vi.fn(),
+      text: vi.fn(),
+      confirm: vi.fn(),
+      note: vi.fn(),
+      outro: vi.fn(),
+    };
+    wizardMocks.createClackPrompter.mockReturnValue(prompter);
+
+    await agentsAddCommand({ name: "агент✨" }, runtime);
+
+    expect(prompter.outro).toHaveBeenCalledWith(
+      'Agent name "агент✨" has no valid id characters. Use at least one letter a-z or digit.',
+    );
+    expect(prompter.confirm).not.toHaveBeenCalled();
+    expect(prompter.note).not.toHaveBeenCalled();
+    expect(checkAgentCreationGateMock).not.toHaveBeenCalled();
+    expect(createAgentMock).not.toHaveBeenCalled();
+    expect(writeConfigFileMock).not.toHaveBeenCalled();
+  });
+
   it.each(RESERVED_SYSTEM_AGENT_IDS_FOR_TEST)(
     "rejects reserved system-agent id %s from an interactive positional argument",
     async (name) => {
@@ -300,11 +341,44 @@ describe("agents add command", () => {
         validateCatalog: false,
       }),
     );
-    expect(onboardHelpersMocks.ensureWorkspaceAndSessions).toHaveBeenCalledWith(
-      "/tmp/openclaw-jon",
-      runtime,
-      expect.objectContaining({ agentId: "jon" }),
+    expect(checkAgentCreationGateMock).toHaveBeenCalledWith("jon");
+    expect(createAgentMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entry: expect.objectContaining({ id: "jon", workspace: "/tmp/openclaw-jon" }),
+        stagedConfig: expect.any(Object),
+        transformConfig: transformConfigWithPendingPluginInstallsMock,
+      }),
     );
+  });
+
+  it("surfaces the canonical main gate before guided auth or workspace side effects", async () => {
+    readConfigFileSnapshotMock.mockResolvedValue({
+      ...baseConfigSnapshot,
+      config: { agents: { entries: { robby: { id: "robby" } } } },
+      sourceConfig: { agents: { entries: { robby: { id: "robby" } } } },
+    });
+    const prompter = {
+      intro: vi.fn(),
+      text: vi.fn(),
+      confirm: vi.fn(),
+      note: vi.fn(),
+      outro: vi.fn(),
+    };
+    wizardMocks.createClackPrompter.mockReturnValue(prompter);
+    checkAgentCreationGateMock.mockResolvedValueOnce({
+      status: "error",
+      reason: "legacy-session-migration-required",
+      agentId: "main",
+      message: "Run openclaw doctor --fix, then retry.",
+    });
+
+    await agentsAddCommand({ name: "main" }, runtime);
+
+    expect(checkAgentCreationGateMock).toHaveBeenCalledWith("main");
+    expect(prompter.outro).toHaveBeenCalledWith("Run openclaw doctor --fix, then retry.");
+    expect(prompter.text).not.toHaveBeenCalled();
+    expect(authChoiceMocks.applyAuthChoice).not.toHaveBeenCalled();
+    expect(createAgentMock).not.toHaveBeenCalled();
   });
 
   it.each(["legacy-main", "state-db"] as const)(

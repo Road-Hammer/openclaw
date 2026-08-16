@@ -114,15 +114,6 @@ export const cliCommandCatalog: readonly CliCommandCatalogEntry[] = [
     },
   },
   {
-    commandPath: ["delivery"],
-    policy: {
-      configGuard: "skip",
-      loadPlugins: "never",
-      ensureCliPath: false,
-      networkProxy: "bypass",
-    },
-  },
-  {
     commandPath: ["crestodian"], // hidden alias
     policy: { configGuard: "skip", loadPlugins: "never", ensureCliPath: false },
   },
@@ -225,6 +216,15 @@ export const cliCommandCatalog: readonly CliCommandCatalogEntry[] = [
       networkProxy: "bypass",
     },
     route: { id: "health" },
+  },
+  {
+    commandPath: ["audit"],
+    policy: {
+      configGuard: "skip",
+      loadPlugins: "never",
+      ensureCliPath: false,
+      networkProxy: "bypass",
+    },
   },
   {
     commandPath: ["gateway"],
