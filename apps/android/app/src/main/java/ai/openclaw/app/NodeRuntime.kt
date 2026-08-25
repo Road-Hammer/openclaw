@@ -72,7 +72,6 @@ import ai.openclaw.app.node.CameraCaptureManager
 import ai.openclaw.app.node.CameraHandler
 import ai.openclaw.app.node.ConnectionManager
 import ai.openclaw.app.node.ContactsHandler
-import ai.openclaw.app.node.DEFAULT_SEAM_COLOR_ARGB
 import ai.openclaw.app.node.DebugHandler
 import ai.openclaw.app.node.DeviceHandler
 import ai.openclaw.app.node.DeviceNotificationListenerService
@@ -91,8 +90,8 @@ import ai.openclaw.app.node.TalkHandler
 import ai.openclaw.app.node.asObjectOrNull
 import ai.openclaw.app.node.asStringOrNull
 import ai.openclaw.app.node.invokeErrorFromThrowable
-import ai.openclaw.app.node.parseHexColorArgb
 import ai.openclaw.app.node.readAndroidPermissionSnapshot
+import ai.openclaw.app.node.resolveGatewayAccentArgb
 import ai.openclaw.app.systemagent.SystemAgentChatController
 import ai.openclaw.app.systemagent.SystemAgentChatState
 import ai.openclaw.app.systemagent.SystemAgentGatewayAccess
@@ -1185,8 +1184,8 @@ class NodeRuntime private constructor(
   private val _gatewayUpdateAvailable = MutableStateFlow<GatewayUpdateAvailableSummary?>(null)
   val gatewayUpdateAvailable: StateFlow<GatewayUpdateAvailableSummary?> = _gatewayUpdateAvailable.asStateFlow()
 
-  private val _seamColorArgb = MutableStateFlow(DEFAULT_SEAM_COLOR_ARGB)
-  val seamColorArgb: StateFlow<Long> = _seamColorArgb.asStateFlow()
+  private val _gatewayAccentArgb = MutableStateFlow<Long?>(null)
+  val gatewayAccentArgb: StateFlow<Long?> = _gatewayAccentArgb.asStateFlow()
   private val _modelCatalog = MutableStateFlow<List<GatewayModelSummary>>(emptyList())
   val modelCatalog: StateFlow<List<GatewayModelSummary>> = _modelCatalog.asStateFlow()
   private val _providerModelCatalog = MutableStateFlow<List<GatewayModelSummary>>(emptyList())
@@ -1326,7 +1325,7 @@ class NodeRuntime private constructor(
   // response from publishing into a replacement socket on the same stable endpoint.
   private val gatewayMethodsLock = Any()
   private var gatewayApprovalRpcFamily = GatewayApprovalRpcFamily.Unavailable
-  private var gatewayProgressCardAdvertised: Boolean? = null
+  private var gatewayAdvertisedMethods: Set<String>? = null
   private var gatewayMethodsEpoch = 0L
 
   @Volatile internal var gatewayDataRequestOverrideForTests: GatewayDataRequestOverride? = null
@@ -1404,9 +1403,10 @@ class NodeRuntime private constructor(
         replaceGatewayMethods(hello.methods)
         val operatorScopes = normalizeOperatorScopes(hello.authScopes)
         _operatorScopes.value = operatorScopes
+        // Pairing capabilities require positive hello advertisement; an unknown catalog grants none.
         _devicePairingCapabilities.value =
-          selectGatewayDevicePairingCapabilities(hello.methods, operatorScopes)
-        _seamColorArgb.value = DEFAULT_SEAM_COLOR_ARGB
+          selectGatewayDevicePairingCapabilities(hello.methods.orEmpty(), operatorScopes)
+        _gatewayAccentArgb.value = null
         val mainSessionKey =
           prepareMainSessionKey(resolveAgentIdFromMainSessionKey(hello.mainSessionKey))
         // Create/adopt before history refresh; this keeps the first connected read on the
@@ -1425,6 +1425,7 @@ class NodeRuntime private constructor(
         wearProxyBridge()?.publishConnection(connected = true, status = "Connected")
         scope.launch {
           subscribeOperatorSessionEvents()
+          refreshBrandingFromGateway()
           refreshWakeWordsFromGateway()
           refreshExecApprovalsFromGateway()
           if (voiceReplySpeakerLazy.isInitialized()) {
@@ -1675,7 +1676,7 @@ class NodeRuntime private constructor(
     replaceGatewayMethods(null)
     _operatorScopes.value = emptyList()
     _devicePairingCapabilities.value = GatewayDevicePairingCapabilities()
-    _seamColorArgb.value = DEFAULT_SEAM_COLOR_ARGB
+    _gatewayAccentArgb.value = null
     _gatewayAgents.value = emptyList()
     selectedChatAgentId = null
     _modelCatalog.value = emptyList()
@@ -1918,7 +1919,7 @@ class NodeRuntime private constructor(
           cacheScope = ::chatCacheScope,
           currentDefaultAgentId = { gatewayDefaultAgentId.value },
           currentDefaultAgentRevision = gatewayDefaultAgentRevision::get,
-          gatewayAdvertisesProgressCard = ::gatewayAdvertisesProgressCard,
+          gatewayAdvertisesMethod = ::gatewayAdvertisesMethod,
           commandOutbox = chatCommandOutbox,
           recordModelRecent = prefs::recordModelRecent,
           onSessionDeleted = ::publishChatSessionDeletion,
@@ -1934,7 +1935,7 @@ class NodeRuntime private constructor(
           scope = scope,
           json = json,
           requestGateway = AndroidScreenshotFixture::request,
-          gatewayAdvertisesProgressCard = { true },
+          gatewayAdvertisesMethod = { _ -> true },
         )
     }.also {
       it.applyMainSessionKey(_mainSessionKey.value)
@@ -5531,11 +5532,9 @@ class NodeRuntime private constructor(
       val res = requestGatewayData(gatewayScope, "config.get", "{}")
       val root = json.parseToJsonElement(res).asObjectOrNull()
       val config = root?.get("config").asObjectOrNull()
-      val ui = config?.get("ui").asObjectOrNull()
-      val raw = ui?.get("seamColor").asStringOrNull()?.trim()
-      val parsed = parseHexColorArgb(raw)
+      val parsed = resolveGatewayAccentArgb(config)
       publishGatewayData(gatewayScope) {
-        _seamColorArgb.value = parsed ?: DEFAULT_SEAM_COLOR_ARGB
+        _gatewayAccentArgb.value = parsed
       }
     } catch (_: Throwable) {
       // ignore
@@ -7400,8 +7399,8 @@ class NodeRuntime private constructor(
   private fun replaceGatewayMethods(methods: Set<String>?) {
     synchronized(gatewayMethodsLock) {
       val advertisedMethods = methods.orEmpty()
+      gatewayAdvertisedMethods = methods
       gatewayApprovalRpcFamily = selectGatewayApprovalRpcFamily(advertisedMethods)
-      gatewayProgressCardAdvertised = methods?.let { GatewayMethod.ProgressCardGet.rawValue in it }
       _clawHubSkillMethodsAvailable.value = supportsClawHubSkillManagement(advertisedMethods)
       _desktopObserveAvailable.value = GatewayMethod.DesktopObserve.rawValue in advertisedMethods
       systemAgentChatSupported.value = GatewayMethod.OpenclawChat.rawValue in advertisedMethods
@@ -7409,7 +7408,7 @@ class NodeRuntime private constructor(
     }
   }
 
-  private fun gatewayAdvertisesProgressCard(): Boolean? = synchronized(gatewayMethodsLock) { gatewayProgressCardAdvertised }
+  private fun gatewayAdvertisesMethod(method: String): Boolean? = synchronized(gatewayMethodsLock) { gatewayAdvertisedMethods?.let { method in it } }
 
   private fun captureGatewayMethods(): GatewayMethodsSnapshot =
     synchronized(gatewayMethodsLock) {
@@ -8329,10 +8328,10 @@ internal fun gatewayRegistryEntry(
     )
   }
 
-/** HTTP(S) origin serving the connected gateway's Control UI pages. */
+/** HTTP(S) base URL serving the connected gateway's Control UI pages. */
 internal fun gatewayControlPageBaseUrl(endpoint: GatewayEndpoint): String {
   val scheme = if (endpoint.tlsEnabled) "https" else "http"
-  return "$scheme://${formatGatewayAuthority(endpoint.host, endpoint.port)}"
+  return "$scheme://${formatGatewayAuthority(endpoint.host, endpoint.port)}${endpoint.contextPath}"
 }
 
 data class GatewayModelSummary(

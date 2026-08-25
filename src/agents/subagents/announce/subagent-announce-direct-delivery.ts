@@ -80,6 +80,7 @@ async function runAnnounceAgentCall(params: {
     forceSyntheticClient: shouldPreserveUserFacingSessionStateForInputProvenance(
       params.agentParams.inputProvenance,
     ),
+    operatorRoleActor: { kind: "system" },
     delegatedToolPolicyHandoff: params.delegatedToolPolicyHandoff,
     timeoutMs: params.timeoutMs,
     resolveGatewayContext: params.resolveGatewayContext,
@@ -230,9 +231,12 @@ export async function sendSubagentAnnounceDirectly(params: {
         onDeliveryResult: params.onDeliveryResult,
         isSourceSessionEffectsAllowed: isCompletionDeliveryAllowed,
       });
+    // Synthetic requester-settle turns must not inherit a tool-only mode that suppresses the final.
     const completionSourceReplyDeliveryMode = requiresMessageToolDelivery
       ? "message_tool_only"
-      : undefined;
+      : params.requireVisibleReply && deliveryTarget.deliver
+        ? "automatic"
+        : undefined;
     const shouldDeliverAgentFinal = deliveryTarget.deliver && !requiresMessageToolDelivery;
     const requesterQueueSettings = resolveQueueSettings({
       cfg,
@@ -383,7 +387,7 @@ export async function sendSubagentAnnounceDirectly(params: {
       if (err instanceof SourceOwnerChangedError) {
         return sourceOwnerChangedResult();
       }
-      if (isPermanentAnnounceDeliveryError(err) && hasAnnounceSendEvidence(err)) {
+      if (hasAnnounceSendEvidence(err)) {
         throw err;
       }
       if (
@@ -435,6 +439,7 @@ export async function sendSubagentAnnounceDirectly(params: {
     const completionPayloadVisibility = {
       includeErrorPayloads: false,
       includeReasoningPayloads: false,
+      requireTerminalContent: true,
     };
     const hasVisibleGatewayPayload = Boolean(
       directAnnounceResult &&
@@ -519,35 +524,19 @@ export async function sendSubagentAnnounceDirectly(params: {
         error: "completion agent did not use the message tool for message-tool-only delivery",
       };
     }
-    const hasVisibleCompletionReply = Boolean(
+    const requesterVisibleFinalDelivered = Boolean(
       directAnnounceResult &&
-      ((params.requireVisibleReply
-        ? hasMessagingToolDeliveryToSource(directAnnounceResult, deliveryTarget, {
-            requireFinalReply: true,
-          })
-        : hasMessagingToolDelivery) ||
-        (hasVisibleAgentPayload(
-          params.requireVisibleReply
-            ? {
-                payloads: Array.isArray(directAnnounceResult.payloads)
-                  ? directAnnounceResult.payloads.filter((payload) => {
-                      const flags = payload as Record<string, unknown>;
-                      return (
-                        flags?.isCommentary !== true &&
-                        flags?.isCompactionNotice !== true &&
-                        flags?.isFallbackNotice !== true &&
-                        flags?.isStatusNotice !== true &&
-                        flags?.visible !== false
-                      );
-                    })
-                  : [],
-              }
-            : directAnnounceResult,
-          { ...completionPayloadVisibility, includeSilentReplyPayloads: false },
-        ) &&
-          (!params.requireVisibleReply ||
-            directAnnounceResult.deliveryStatus?.status !== "suppressed"))),
+      (hasMessagingToolDeliveryToSource(directAnnounceResult, deliveryTarget, {
+        requireFinalReply: true,
+      }) ||
+        (shouldDeliverAgentFinal &&
+          hasVisibleNonSilentGatewayPayload &&
+          directAnnounceResult.deliveryStatus?.status !== "suppressed")),
     );
+    const hasVisibleCompletionReply =
+      requesterVisibleFinalDelivered ||
+      (!params.requireVisibleReply &&
+        (hasMessagingToolDelivery || hasVisibleNonSilentGatewayPayload));
     const acceptsIntentionalSilentCompletion =
       hasIntentionalSilentCompletionReply && !isSubagentCompletion;
     if (
@@ -583,14 +572,18 @@ export async function sendSubagentAnnounceDirectly(params: {
     return {
       delivered: true,
       path: "direct",
+      ...(params.expectsCompletionMessage &&
+      !params.requesterIsSubagent &&
+      requesterVisibleFinalDelivered
+        ? { requesterVisibleFinalDelivered: true }
+        : {}),
     };
   } catch (err) {
-    const permanent = isPermanentAnnounceDeliveryError(err);
-    const disposition = permanent
-      ? hasAnnounceSendEvidence(err)
-        ? "ambiguous"
-        : "permanent_failure"
-      : "retryable";
+    const disposition = hasAnnounceSendEvidence(err)
+      ? "ambiguous"
+      : isPermanentAnnounceDeliveryError(err)
+        ? "permanent_failure"
+        : "retryable";
     return {
       delivered: false,
       path: "direct",
