@@ -1,7 +1,7 @@
-import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { Locator, Page } from "playwright";
-import { expect, it } from "vitest";
+import { beforeEach, expect, it } from "vitest";
+import { createControlUiE2eArtifactDir } from "../test-helpers/control-ui-e2e-artifacts.ts";
 import {
   controlUiBundledSettingsStorageKey,
   installMockGateway,
@@ -19,7 +19,13 @@ const suite = createControlUiE2eSuite({
 });
 
 const sessionKey = "agent:main:side-panel-clearance";
-const proofDir = process.env.OPENCLAW_UI_RAIL_PROOF_DIR?.trim();
+const proofDirParent = process.env.OPENCLAW_UI_RAIL_PROOF_DIR?.trim();
+let proofDir: string | undefined;
+beforeEach(() => {
+  proofDir = proofDirParent
+    ? createControlUiE2eArtifactDir("chat-side-panel-clearance", proofDirParent)
+    : undefined;
+});
 const limitedScopes = ["operator.read", "operator.write"];
 const historyMessages = [
   {
@@ -40,7 +46,6 @@ function scenario(
   options: {
     custodian?: boolean;
     operatorScopes?: string[];
-    updateAvailable?: ControlUiMockGatewayScenario["updateAvailable"];
   } = {},
 ): ControlUiMockGatewayScenario {
   return {
@@ -84,7 +89,6 @@ function scenario(
       },
     },
     ...(options.operatorScopes ? { operatorScopes: options.operatorScopes } : {}),
-    ...(options.updateAvailable ? { updateAvailable: options.updateAvailable } : {}),
     sessionKey,
     workspace: "/workspace/openclaw",
     workspaceGit: true,
@@ -198,7 +202,6 @@ async function capturePanel(page: Page, name: string): Promise<void> {
   if (!proofDir) {
     return;
   }
-  await mkdir(proofDir, { recursive: true });
   await page.screenshot({ fullPage: true, path: path.join(proofDir, `${name}.png`) });
 }
 
@@ -210,13 +213,11 @@ suite.define(() => {
       deviceLess: false,
       direction: "ltr",
       expectedControl: ".shell-chrome-controls__search",
-      expectedUpdate: false,
       name: "expanded navigation",
       navCollapsed: false,
       operatorScopes: undefined,
       proof: "expanded-nav",
       themeMode: "dark" as const,
-      updateAvailable: undefined,
     },
     {
       beforeExpandProof: undefined,
@@ -224,13 +225,11 @@ suite.define(() => {
       deviceLess: false,
       direction: "ltr",
       expectedControl: ".shell-chrome-controls__search",
-      expectedUpdate: false,
       name: "collapsed navigation",
       navCollapsed: true,
       operatorScopes: undefined,
       proof: "collapsed-nav",
       themeMode: "dark" as const,
-      updateAvailable: undefined,
     },
     {
       beforeExpandProof: undefined,
@@ -238,17 +237,11 @@ suite.define(() => {
       deviceLess: false,
       direction: "ltr",
       expectedControl: ".shell-chrome-controls__custodian",
-      expectedUpdate: true,
       name: "collapsed navigation with custodian and attention",
       navCollapsed: true,
       operatorScopes: undefined,
       proof: "collapsed-nav-custodian-attention",
       themeMode: "dark" as const,
-      updateAvailable: {
-        channel: "stable",
-        currentVersion: "2026.8.1",
-        latestVersion: "2026.8.2",
-      },
     },
     {
       beforeExpandProof: undefined,
@@ -256,13 +249,11 @@ suite.define(() => {
       deviceLess: true,
       direction: "rtl",
       expectedControl: ".sidebar-attention--floating .sidebar-issues-button",
-      expectedUpdate: false,
       name: "collapsed RTL limited-access status and attention",
       navCollapsed: true,
       operatorScopes: limitedScopes,
       proof: "collapsed-rtl-limited-attention",
       themeMode: "dark" as const,
-      updateAvailable: undefined,
     },
   ])("keeps expanded panel controls in a compact safe gap for $name", async (testCase) => {
     await suite.withPage(
@@ -282,7 +273,6 @@ suite.define(() => {
           scenario({
             custodian: testCase.custodian,
             operatorScopes: testCase.operatorScopes,
-            updateAvailable: testCase.updateAvailable,
           }),
         );
         await openExpandedFilesPanel(page, testCase.beforeExpandProof);
@@ -297,19 +287,6 @@ suite.define(() => {
           await page.locator(".sidebar-attention--floating .sidebar-issues-button").waitFor();
         }
         await page.locator(testCase.expectedControl).waitFor();
-        if (testCase.expectedUpdate) {
-          const updateSlot = page.locator(
-            ".sidebar-attention--floating .sidebar-footer-update-slot",
-          );
-          await updateSlot.waitFor();
-          await updateSlot.hover();
-          await waitForShellLayout(page);
-          await expectPanelHeaderControlsClearShellChrome(page);
-          await page.mouse.move(800, 700);
-          await updateSlot.locator(".sidebar-footer-update").focus();
-          await waitForShellLayout(page);
-          await expectPanelHeaderControlsClearShellChrome(page);
-        }
         await waitForShellLayout(page);
         await expectPanelHeaderControlsClearShellChrome(page);
         await capturePanel(page, testCase.proof);

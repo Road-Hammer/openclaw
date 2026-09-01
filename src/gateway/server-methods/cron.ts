@@ -25,7 +25,10 @@ import {
   assertValidCronCreateDelivery,
   assertValidCronFailureAlert,
 } from "../../cron/delivery-channel-validation.js";
-import { resolveCronDeliveryPreviews } from "../../cron/delivery-preview.js";
+import {
+  resolveCronDeliveryPreview,
+  resolveCronDeliveryPreviews,
+} from "../../cron/delivery-preview.js";
 import { assertCronDeliveryInputNonBlankFields } from "../../cron/delivery-target-validation.js";
 import { resolveCronListSnapshotRevision } from "../../cron/list-snapshot-revision.js";
 import { normalizeCronJobCreate, normalizeCronJobPatch } from "../../cron/normalize.js";
@@ -44,7 +47,12 @@ import {
   readCronTaskRunHistoryPage,
 } from "../../cron/task-run-history.js";
 import { cronJobUsesToolRuntime } from "../../cron/tools-allow.js";
-import type { CronJob, CronJobCreate, CronJobPatch } from "../../cron/types.js";
+import type {
+  CronDeliveryPreview,
+  CronJob,
+  CronJobCreate,
+  CronJobPatch,
+} from "../../cron/types.js";
 import { validateScheduleTimestamp } from "../../cron/validate-timestamp.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { resolveTargetPrefixedChannel } from "../../infra/outbound/channel-target-prefix.js";
@@ -213,9 +221,29 @@ function cronJobReadView(job: CronJob) {
     lastDelivered: job.state.lastDelivered,
     lastDeliveryStatus: job.state.lastDeliveryStatus,
     lastDeliveryError: job.state.lastDeliveryError,
+    deliverySuppressionReason: job.state.deliverySuppressionReason,
     lastFailureNotificationDelivered: job.state.lastFailureNotificationDelivered,
     lastFailureNotificationDeliveryStatus: job.state.lastFailureNotificationDeliveryStatus,
     lastFailureNotificationDeliveryError: job.state.lastFailureNotificationDeliveryError,
+  };
+}
+
+function cronAddPayloadWithDeliveryPreview(params: {
+  result: CronJob | { created: boolean; updated?: boolean; job: CronJob };
+  deliveryPreview: CronDeliveryPreview;
+}) {
+  const job = "job" in params.result ? params.result.job : params.result;
+  if ("job" in params.result) {
+    return {
+      created: params.result.created,
+      ...(params.result.updated === undefined ? {} : { updated: params.result.updated }),
+      job: cronJobReadView(job),
+      deliveryPreview: params.deliveryPreview,
+    };
+  }
+  return {
+    ...cronJobReadView(job),
+    deliveryPreview: params.deliveryPreview,
   };
 }
 
@@ -241,6 +269,9 @@ function compactCronListJob(job: CronJob) {
       : {}),
     ...(job.state.lastDeliveryError !== undefined
       ? { lastDeliveryError: job.state.lastDeliveryError }
+      : {}),
+    ...(job.state.deliverySuppressionReason !== undefined
+      ? { deliverySuppressionReason: job.state.deliverySuppressionReason }
       : {}),
     ...(job.state.lastFailureNotificationDelivered !== undefined
       ? { lastFailureNotificationDelivered: job.state.lastFailureNotificationDelivered }
@@ -849,7 +880,18 @@ export const cronHandlers: GatewayRequestHandlers = {
       return;
     }
     const callerScope = readCronCallerScope(client);
-    const createdActor = resolveOperatorSessionCreation(client, { allowTrustedHint: true }).actor;
+    const operatorActor = callerScope ? undefined : resolveOperatorSessionCreation(client).actor;
+    // Agent-tool clients own one exact signed session. Read that session's creator instead of
+    // reclassifying spawn context as the automation creator; params never carry this provenance.
+    const actor =
+      operatorActor ??
+      (callerScope?.sessionKey
+        ? loadGatewaySessionEntryReadOnly(callerScope.sessionKey, {
+            agentId: callerScope.agentId,
+          }).entry?.createdActor
+        : undefined);
+    const actorId = normalizeOptionalString(actor?.id);
+    const createdActor = actor ? { ...actor, ...(actorId ? { id: actorId } : {}) } : undefined;
     let captureRuntimeAuthority: (() => CronRuntimeAuthority | undefined) | undefined;
     try {
       captureRuntimeAuthority = resolveCronCreatorAuthorityCapture(callerScope);
@@ -906,6 +948,13 @@ export const cronHandlers: GatewayRequestHandlers = {
       );
       return;
     }
+    // Resolve before the durable add. A preview failure after commit would make a safe retry
+    // create a duplicate job.
+    const deliveryPreview = await resolveCronDeliveryPreview({
+      cfg,
+      defaultAgentId: context.cron.getDefaultAgentId(),
+      job: jobCreate,
+    });
     let result: Awaited<ReturnType<typeof context.cron.add>>;
     try {
       result = await context.cron.add(jobCreate, {
@@ -925,6 +974,9 @@ export const cronHandlers: GatewayRequestHandlers = {
               scheduledToolPolicy: resolveCronScheduledToolPolicyForCaller(callerScope),
               ...(callerScope?.toolsAllowProvenance
                 ? { toolsAllowProvenance: callerScope.toolsAllowProvenance }
+                : {}),
+              ...(callerScope?.toolsAllowExecTarget
+                ? { toolsAllowExecTarget: callerScope.toolsAllowExecTarget }
                 : {}),
             }
           : {}),
@@ -955,13 +1007,10 @@ export const cronHandlers: GatewayRequestHandlers = {
     });
     respond(
       true,
-      "job" in result
-        ? {
-            created: result.created,
-            ...(result.updated === undefined ? {} : { updated: result.updated }),
-            job: cronJobReadView(job),
-          }
-        : cronJobReadView(job),
+      cronAddPayloadWithDeliveryPreview({
+        result,
+        deliveryPreview,
+      }),
       undefined,
     );
   },
@@ -1129,6 +1178,9 @@ export const cronHandlers: GatewayRequestHandlers = {
               scheduledToolPolicy: resolveCronScheduledToolPolicyForCaller(callerScope),
               ...(callerScope?.toolsAllowProvenance
                 ? { toolsAllowProvenance: callerScope.toolsAllowProvenance }
+                : {}),
+              ...(callerScope?.toolsAllowExecTarget
+                ? { toolsAllowExecTarget: callerScope.toolsAllowExecTarget }
                 : {}),
               ...(commitGuard ? { commitGuard } : {}),
               ...(captureRuntimeAuthority ? { captureRuntimeAuthority } : {}),

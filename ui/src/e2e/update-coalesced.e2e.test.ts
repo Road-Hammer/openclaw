@@ -40,7 +40,9 @@ async function captureUpdateProof(
 
 suite.define(() => {
   it("explains a disabled update to a read-only mobile operator", async () => {
-    const artifactDir = path.resolve(".artifacts/control-ui-e2e/update-read-only-mobile");
+    const artifactDir = captureUiProofEnabled
+      ? path.join(suite.artifactDir, "update-read-only-mobile")
+      : "";
     await suite.withPage(
       {
         colorScheme: "dark",
@@ -81,10 +83,6 @@ suite.define(() => {
         );
         await captureUpdateProof(page, artifactDir, "disabled-update.png");
 
-        const actionBounds = await action.boundingBox();
-        if (!actionBounds) {
-          throw new Error("disabled update action is not visible");
-        }
         const tooltip = updateIssue.locator("openclaw-tooltip wa-tooltip");
         await tooltip.evaluate((element) => {
           element.addEventListener(
@@ -93,10 +91,7 @@ suite.define(() => {
             { once: true },
           );
         });
-        await page.touchscreen.tap(
-          actionBounds.x + actionBounds.width / 2,
-          actionBounds.y + actionBounds.height / 2,
-        );
+        await updateIssue.locator(".sidebar-update-card__actions").tap();
         await expect.poll(() => tooltip.getAttribute("data-e2e-after-show")).not.toBeNull();
         expect(await tooltip.textContent()).toContain("Administrator access is required");
         expect(await gateway.getRequests("update.run")).toHaveLength(0);
@@ -106,7 +101,9 @@ suite.define(() => {
   });
 
   it("shows package update failure status after the Update click", async () => {
-    const artifactDir = path.resolve(".artifacts/control-ui-e2e/update-package-status");
+    const artifactDir = captureUiProofEnabled
+      ? path.join(suite.artifactDir, "update-package-status")
+      : "";
     await suite.withPage(
       {
         locale: "en-US",
@@ -159,7 +156,7 @@ suite.define(() => {
         );
         await updateIssue.locator("summary").click();
         await updateIssue.locator(".sidebar-update-card__compact-reason").waitFor();
-        expect(await page.locator(".sidebar-footer-update").count()).toBe(1);
+        expect(await page.locator(".sidebar-issues-button__count").count()).toBe(1);
         expect(pageErrors).toEqual([]);
         await captureUpdateProof(page, artifactDir, "package-update-failure.png");
       },
@@ -167,7 +164,9 @@ suite.define(() => {
   });
 
   it("shows coalesced restart feedback after the Update click", async () => {
-    const artifactDir = path.resolve(".artifacts/control-ui-e2e/update-coalesced");
+    const artifactDir = captureUiProofEnabled
+      ? path.join(suite.artifactDir, "update-coalesced")
+      : "";
     await suite.withPage(
       {
         locale: "en-US",
@@ -219,7 +218,7 @@ suite.define(() => {
             { exact: true },
           )
           .waitFor();
-        expect(await page.locator(".sidebar-footer-update").count()).toBe(1);
+        expect(await page.locator(".sidebar-issues-button__count").count()).toBe(1);
         expect(pageErrors).toEqual([]);
         await captureUpdateProof(page, artifactDir, "coalesced-restart-banner.png");
       },
@@ -244,9 +243,9 @@ suite.define(() => {
   ])(
     "settles the managed update $name",
     async ({ artifactName, expectedStatusRequests, expectedText, responseFirst }) => {
-      const artifactDir = path.resolve(
-        `.artifacts/control-ui-e2e/update-managed-handoff-${artifactName}`,
-      );
+      const artifactDir = captureUiProofEnabled
+        ? path.join(suite.artifactDir, `update-managed-handoff-${artifactName}`)
+        : "";
       await suite.withPage(
         {
           locale: "en-US",
@@ -320,7 +319,9 @@ suite.define(() => {
   );
 
   it("shows and routes the update target from live Mac app ownership", async () => {
-    const artifactDir = path.resolve(".artifacts/control-ui-e2e/update-ownership");
+    const artifactDir = captureUiProofEnabled
+      ? path.join(suite.artifactDir, "update-ownership")
+      : "";
     const context = await suite.browser.newContext({
       locale: "en-US",
       serviceWorkers: "block",

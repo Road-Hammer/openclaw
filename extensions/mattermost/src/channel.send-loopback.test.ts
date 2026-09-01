@@ -2,10 +2,10 @@
 import { createPluginRuntimeMock } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { withServer } from "openclaw/plugin-sdk/test-env";
 import { describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "../runtime-api.js";
 import { mattermostPlugin } from "./channel.js";
 import { deliverMattermostReplyPayload } from "./mattermost/reply-delivery.js";
 import { sendMessageMattermost } from "./mattermost/send.js";
-import type { OpenClawConfig } from "./runtime-api.js";
 import { setMattermostRuntime } from "./runtime.js";
 
 const CHANNEL_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -198,7 +198,7 @@ describe("Mattermost send action loopback", () => {
         setMattermostRuntime(createPluginRuntimeMock());
         loadOutboundMediaFromUrl.mockReset();
         loadOutboundMediaFromUrl.mockResolvedValueOnce({
-          buffer: Buffer.from("unnamed-image"),
+          buffer: Buffer.from("!unnamed-image?").subarray(1, -1),
           contentType: "image/png",
           kind: "image",
         });
@@ -233,5 +233,6 @@ describe("Mattermost send action loopback", () => {
     expect(uploads).toHaveLength(1);
     expect(uploads[0]).toContain('filename="upload.png"');
     expect(uploads[0]).toContain("Content-Type: image/png");
+    expect(uploads[0]).toContain("\r\n\r\nunnamed-image\r\n");
   });
 });
