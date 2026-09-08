@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
+# Bash 5.3+ can deadlock writing heredoc pipes on macOS before the reader starts.
+if [[ ${OSTYPE:-} == darwin* && $BASH != /bin/bash ]] && ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3))); then
+  exec /bin/bash "$0" "$@"
+fi
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT_DIR/scripts/lib/docker-e2e-package.sh"
 source "$ROOT_DIR/scripts/lib/openclaw-e2e-instance.sh"
+source "$ROOT_DIR/scripts/e2e/lib/prepublish-plugin-registry.sh"
 
 read_positive_int_env() {
   local name="${1:?missing environment variable name}"
@@ -26,6 +31,8 @@ PACKAGE_TGZ="${OPENCLAW_BUN_GLOBAL_SMOKE_PACKAGE_TGZ:-}"
 COMMAND_TIMEOUT_MS="$(read_positive_int_env OPENCLAW_BUN_GLOBAL_SMOKE_TIMEOUT_MS 180000)"
 DOCKER_COMMAND_TIMEOUT="${DOCKER_COMMAND_TIMEOUT:-${OPENCLAW_BUN_GLOBAL_SMOKE_DOCKER_COMMAND_TIMEOUT:-600s}}"
 AI_PACKAGE_TGZ=""
+REGISTRY_PID=""
+REQUIRED_REGISTRY_PACKAGES='[]'
 SMOKE_DIR=""
 PACK_DIR=""
 MOCK_PID=""
@@ -34,6 +41,7 @@ INSTALL_LOG=""
 UNTRUSTED_LOG=""
 CLI_STATUS_LOG=""
 CLI_PLUGINS_LOG=""
+DIRECT_BUN_LOG=""
 MOCK_LOG=""
 MOCK_REQUEST_LOG=""
 LOCAL_AGENT_LOG=""
@@ -44,6 +52,7 @@ GATEWAY_AGENT_LOG=""
 cleanup() {
   openclaw_e2e_stop_process "${GATEWAY_PID:-}"
   openclaw_e2e_stop_process "${MOCK_PID:-}"
+  openclaw_e2e_stop_process "${REGISTRY_PID:-}"
   if [ -n "${SMOKE_DIR:-}" ]; then
     rm -rf "$SMOKE_DIR"
   fi
@@ -60,6 +69,7 @@ dump_debug_logs() {
     "$UNTRUSTED_LOG" \
     "$CLI_STATUS_LOG" \
     "$CLI_PLUGINS_LOG" \
+    "$DIRECT_BUN_LOG" \
     "$MOCK_LOG" \
     "$MOCK_REQUEST_LOG" \
     "$LOCAL_AGENT_LOG" \
@@ -84,8 +94,13 @@ prepare_ai_candidate() {
 const manifest = require(process.argv[1]);
 process.exit(manifest.dependencies?.["@openclaw/ai"] ? 0 : 1);
 ' "$root_manifest"; then
-      echo "OpenClaw tarball declares @openclaw/ai but does not bundle it" >&2
-      exit 1
+      if [ -z "${OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_DIR:-}" ]; then
+        echo "OpenClaw tarball requires a verified candidate registry for unbundled @openclaw/ai" >&2
+        exit 1
+      fi
+      REQUIRED_REGISTRY_PACKAGES='["@openclaw/ai"]'
+      echo "==> Resolve candidate @openclaw/ai from the prepared package registry"
+      return
     fi
     echo "==> Candidate has no bundled @openclaw/ai dependency"
     return
@@ -228,6 +243,8 @@ main() {
 
   resolve_package_tgz
   prepare_ai_candidate
+  openclaw_prepublish_plugin_registry_start_mounted \
+    "$PACK_DIR/registry" REGISTRY_PID "$REQUIRED_REGISTRY_PACKAGES"
 
   local bun_path
   local bun_version
@@ -260,9 +277,8 @@ main() {
     "$XDG_CACHE_HOME" \
     "$OPENCLAW_STATE_DIR"
   export PATH="$BUN_INSTALL/bin:$(dirname "$(command -v node)"):$PATH"
-  # Current root tarballs bundle @openclaw/ai, while older release tarballs do
-  # not declare it. Pin only the bundled dependency; inventing an override for
-  # the older package changes the artifact under test.
+  # Source-export tarballs bundle AI; publication tarballs resolve it from the
+  # prepared registry. Only bundled bytes need Bun's local dependency override.
   if [ -n "$AI_PACKAGE_TGZ" ]; then
     node --input-type=module - \
       "$BUN_INSTALL/install/global/package.json" \
@@ -306,6 +322,7 @@ NODE
   )"
   package_root="$(dirname "$openclaw_entry")"
   export OPENCLAW_E2E_REDACTOR_MODULE="$package_root/dist/plugin-sdk/logging-core.js"
+  "$bun_path" scripts/docker/verify-fs-safe-native.mjs --package-root "$package_root" --mode require
 
   echo "==> Verify OpenClaw lifecycle scripts were trusted and executed"
   run_with_timeout "$COMMAND_TIMEOUT_MS" "$bun_path" pm -g untrusted >"$UNTRUSTED_LOG" 2>&1
@@ -323,20 +340,22 @@ NODE
   echo "==> OpenClaw help through Bun global install"
   run_with_timeout "$COMMAND_TIMEOUT_MS" "$openclaw_bin" --help >/dev/null
 
-  run_bun_cli() {
-    run_with_timeout "$COMMAND_TIMEOUT_MS" "$bun_path" "$openclaw_entry" "$@"
+  run_installed_cli() {
+    run_with_timeout "$COMMAND_TIMEOUT_MS" "$openclaw_bin" "$@"
   }
 
-  echo "==> Installed package entry under Bun"
-  run_bun_cli --version
-  run_bun_cli --help >/dev/null
-  pushd "$HOME" >/dev/null
-  run_with_timeout "$COMMAND_TIMEOUT_MS" "$bun_path" run --bun openclaw --version
-  popd >/dev/null
+  echo "==> Installed package rejects direct Bun runtime execution"
+  DIRECT_BUN_LOG="$SMOKE_DIR/direct-bun.log"
+  if run_with_timeout "$COMMAND_TIMEOUT_MS" "$bun_path" "$openclaw_entry" --version \
+    >"$DIRECT_BUN_LOG" 2>&1; then
+    echo "OpenClaw unexpectedly ran under the unsupported Bun runtime" >&2
+    exit 1
+  fi
+  grep -F "Bun runtime is unsupported" "$DIRECT_BUN_LOG" >/dev/null
 
-  echo "==> OpenClaw image providers under Bun"
+  echo "==> OpenClaw image providers from Bun global install"
   local providers_json
-  providers_json="$(run_bun_cli infer image providers --json)"
+  providers_json="$(run_installed_cli infer image providers --json)"
   OPENCLAW_IMAGE_PROVIDERS_JSON="$providers_json" node scripts/e2e/lib/bun-global-install/assertions.mjs assert-image-providers
 
   read -r gateway_port mock_port < <(reserve_runtime_ports)
@@ -348,15 +367,15 @@ NODE
     "$mock_port" \
     "$gateway_port"
 
-  echo "==> Representative CLI state under Bun"
-  run_bun_cli status --json --timeout 1 >"$CLI_STATUS_LOG" 2>&1
-  run_bun_cli plugins list --json >"$CLI_PLUGINS_LOG" 2>&1
+  echo "==> Representative CLI state from Bun global install"
+  run_installed_cli status --json --timeout 1 >"$CLI_STATUS_LOG" 2>&1
+  run_installed_cli plugins list --json >"$CLI_PLUGINS_LOG" 2>&1
 
-  echo "==> Local mocked agent turn under Bun"
+  echo "==> Local mocked agent turn from Bun global install"
   MOCK_PID="$(openclaw_e2e_start_mock_openai "$mock_port" "$MOCK_LOG")"
   openclaw_e2e_wait_mock_openai "$mock_port"
   : >"$MOCK_REQUEST_LOG"
-  run_bun_cli agent --local \
+  run_installed_cli agent --local \
     --agent main \
     --session-id bun-global-local-agent \
     --message "Return marker $success_marker" \
@@ -368,22 +387,21 @@ NODE
     "$LOCAL_AGENT_LOG" \
     "$MOCK_REQUEST_LOG"
 
-  echo "==> Gateway health and mocked agent turn under Bun"
+  echo "==> Gateway health and mocked agent turn from Bun global install"
   : >"$MOCK_REQUEST_LOG"
   GATEWAY_PID="$(
     openclaw_e2e_start_tracked_process \
       "$GATEWAY_LOG" \
-      "$bun_path" \
-      "$openclaw_entry" \
+      "$openclaw_bin" \
       gateway \
       --port "$gateway_port" \
       --bind loopback
   )"
   openclaw_e2e_wait_gateway_ready "$GATEWAY_PID" "$GATEWAY_LOG" 300 "$gateway_port"
-  run_bun_cli gateway health \
+  run_installed_cli gateway health \
     --token "$OPENCLAW_GATEWAY_TOKEN" \
     --json >"$GATEWAY_HEALTH_LOG" 2>&1
-  run_bun_cli agent \
+  run_installed_cli agent \
     --agent main \
     --session-id bun-global-gateway-agent \
     --message "Return marker $success_marker" \
@@ -395,7 +413,7 @@ NODE
     "$GATEWAY_AGENT_LOG" \
     "$MOCK_REQUEST_LOG"
 
-  echo "bun-global-install-smoke: Bun $bun_version package, CLI, local agent, and Gateway runtime OK"
+  echo "bun-global-install-smoke: Bun $bun_version package install and Node CLI/runtime OK"
 
   if [ -n "${OPENCLAW_BUN_GLOBAL_SMOKE_PROOF_PATH:-}" ]; then
     node --input-type=module - \

@@ -14,6 +14,7 @@ import {
   resolveExecApprovalsFromFile,
   resolveExecModePolicy,
 } from "../infra/exec-approvals.js";
+import type { ExecAutoReviewer } from "../infra/exec-auto-review.js";
 import {
   rejectUnsafeExecControlShellCommand,
   rejectUnsafeExecLiveStateSqliteShellCommand,
@@ -28,6 +29,7 @@ import {
 import type { SecretStoreExecEnvironment } from "../secrets/store/secret-store.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { normalizeDeliveryContext } from "../utils/delivery-context.shared.js";
+import { captureAgentToolSourceExecutionGuard } from "./agent-tool-source-execution-guard.js";
 import { markBackgrounded } from "./bash-process-registry.js";
 import { describeExecTool } from "./bash-tools.descriptions.js";
 import { processGatewayAllowlist } from "./bash-tools.exec-host-gateway.js";
@@ -61,6 +63,7 @@ import {
   attachExecApprovalReview,
   buildExecForegroundResult,
   createExecHostResolver,
+  resolveExecElevatedMode,
   resolveExecReviewerDefaults,
 } from "./bash-tools.exec-support.js";
 import {
@@ -75,7 +78,6 @@ import type {
 } from "./bash-tools.exec-types.js";
 import { formatUnavailableWorkdirFailure, resolveExecWorkdir } from "./bash-tools.exec-workdir.js";
 import { clampWithDefault, readEnvInt, truncateMiddle } from "./bash-tools.shared.js";
-import { createModelExecAutoReviewer } from "./exec-auto-reviewer.js";
 import { EXEC_TOOL_DISPLAY_SUMMARY } from "./tool-description-presets.js";
 import type { AgentToolWithMeta } from "./tools/common.js";
 import { withoutGatewayToolCallerIdentity } from "./tools/gateway-caller-context.js";
@@ -106,6 +108,7 @@ export function createExecTool(
   defaults?: ExecToolDefaults,
 ): AgentToolWithMeta<typeof execSchema, ExecToolDetails> {
   const secretEgressEnabled = isSecretEgressProxyActive();
+  const cleanupMs = defaults?.cleanupMs;
   const preparedRunEnvironment = resolveExecPreparedRunEnvironment(defaults);
   // Agent runs own one tool instance, so the store is read on first exec and reused for that run.
   // A new run constructs a new instance and observes later store mutations.
@@ -194,23 +197,29 @@ export function createExecTool(
     label: "exec",
     displaySummary: EXEC_TOOL_DISPLAY_SUMMARY,
     get description() {
-      return describeExecTool({ agentId, hasCronTool: defaults?.hasCronTool === true });
+      return describeExecTool({ hasCronTool: defaults?.hasCronTool === true });
     },
     parameters: execSchema,
     prepareBeforeToolCallParams: requestPreparation.prepareBeforeToolCallParams,
     finalizeBeforeToolCallParams: requestPreparation.finalizeBeforeToolCallParams,
     execute: async (toolCallId, args, signal, onUpdate) => {
       signal?.throwIfAborted();
+      const assertSourceActive = captureAgentToolSourceExecutionGuard(signal);
       assertSupportedExecParams(args);
-      // Review cancellation belongs to this execution, never another call on the shared tool.
-      const autoReviewer =
-        defaults?.autoReviewer ??
-        createModelExecAutoReviewer({
+      // Capture settings and cancellation per execution; unused reviewers must not load model runtime.
+      let autoReviewer: ExecAutoReviewer | undefined = defaults?.autoReviewer;
+      if (!autoReviewer) {
+        const reviewerParams = {
           cfg: defaults?.config,
           agentId,
           reviewer: resolveExecReviewerDefaults({ defaults, agentId }),
           signal,
-        });
+        };
+        autoReviewer = async (input) => {
+          const { createModelExecAutoReviewer } = await import("./exec-auto-reviewer.js");
+          return createModelExecAutoReviewer(reviewerParams)(input);
+        };
+      }
       let params = requestPreparation.normalizeParams(args);
       const resolveExecEnvPrepared = requestPreparation.isResolveExecEnvPrepared(
         args as ExecToolArgs,
@@ -245,25 +254,7 @@ export function createExecTool(
             )
         : null;
       const elevatedDefaults = defaults?.elevated;
-      const elevatedAllowed = Boolean(elevatedDefaults?.enabled && elevatedDefaults.allowed);
-      const elevatedDefaultMode =
-        elevatedDefaults?.defaultLevel === "full"
-          ? "full"
-          : elevatedDefaults?.defaultLevel === "ask"
-            ? "ask"
-            : elevatedDefaults?.defaultLevel === "on"
-              ? "ask"
-              : "off";
-      const effectiveDefaultMode =
-        elevatedAllowed && !defaults?.sandboxRequired ? elevatedDefaultMode : "off";
-      const elevatedMode =
-        typeof params.elevated === "boolean"
-          ? params.elevated
-            ? elevatedDefaultMode === "full"
-              ? "full"
-              : "ask"
-            : "off"
-          : effectiveDefaultMode;
+      const elevatedMode = resolveExecElevatedMode(defaults, params.elevated);
       const elevatedRequested = elevatedMode !== "off";
       if (elevatedRequested) {
         if (!elevatedDefaults?.enabled || !elevatedDefaults.allowed) {
@@ -439,6 +430,7 @@ export function createExecTool(
           if (!defaults?.operationalRunInstance) {
             throw new Error("Secret egress proxy requires an admitted agent run instance");
           }
+          assertSourceActive();
           secretEgressEnv = registerSecretEgressProxyRun(
             defaults.operationalRunInstance,
             storeEnv.secretEgressBindings ?? [],
@@ -474,6 +466,7 @@ export function createExecTool(
             bashElevated: elevatedDefaults,
             approvalReviewerDeviceId: defaults?.approvalReviewerDeviceId,
             nonInteractiveApproval: defaults?.nonInteractiveApproval,
+            approvalFollowupMode: defaults?.approvalFollowupMode,
             turnSourceChannel: defaults?.messageProvider,
             turnSourceTo: defaults?.currentChannelId,
             turnSourceAccountId: defaults?.accountId,
@@ -555,6 +548,7 @@ export function createExecTool(
             approvalRunningNoticeMs,
             maxOutput,
             pendingMaxOutput,
+            cleanupMs,
             processContinuationAvailable: allowBackground,
             trustedSafeBinDirs,
           });
@@ -600,13 +594,12 @@ export function createExecTool(
           warnings,
           maxOutput,
           pendingMaxOutput,
+          cleanupMs,
           notifyOnExit,
           notifyOnExitEmptySuccess,
           scopeKey: defaults?.scopeKey,
           sessionKey: notifySessionKey,
           agentId,
-          mainKey: defaults?.mainKey,
-          sessionScope: defaults?.sessionScope,
           eventRouting: defaults?.eventRouting,
           notifyDeliveryContext,
           timeoutSec: effectiveTimeout,
