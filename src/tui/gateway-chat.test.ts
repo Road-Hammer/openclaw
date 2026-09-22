@@ -1,13 +1,70 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { GATEWAY_SERVER_CAPS } from "../../packages/gateway-protocol/src/server-capabilities.js";
+import { createDeferred } from "../../test/helpers/promise.js";
 // Covers gateway-backed chat behavior used by the TUI backend.
 
 const { GatewayChatClient } = await import("./gateway-chat.js");
-const { GatewayClientRequestError } = await import("../gateway/client.js");
+const { GatewayClient, GatewayClientRequestError } = await import("../gateway/client.js");
 
 describe("GatewayChatClient", () => {
   afterEach(() => {
     vi.useRealTimers();
   });
+
+  it.each([true, false])(
+    "preserves model availability semantics for published-catalog capability %s",
+    async (published) => {
+      const models = [
+        {
+          provider: "fixture",
+          id: "waiting",
+          name: "Waiting",
+          available: false,
+          unavailableReason: "cooldown",
+        },
+        { provider: "fixture", id: "unknown", name: "Unknown" },
+      ];
+      const request = vi.spyOn(GatewayClient.prototype, "request").mockResolvedValue({ models });
+      try {
+        const client = new GatewayChatClient({ url: "ws://127.0.0.1:18789", token: "test-token" });
+        client.hello = {
+          type: "hello-ok",
+          protocol: 3,
+          server: { version: "test", connId: "catalog-test" },
+          features: {
+            methods: ["models.list"],
+            events: [],
+            capabilities: published ? [GATEWAY_SERVER_CAPS.PUBLISHED_MODEL_CATALOG] : [],
+          },
+          snapshot: {
+            presence: [],
+            health: {},
+            stateVersion: { presence: 0, health: 0 },
+            uptimeMs: 0,
+          },
+          auth: { role: "operator", scopes: ["operator.admin"] },
+          policy: { maxPayload: 1024, maxBufferedBytes: 1024, tickIntervalMs: 1000 },
+        };
+
+        const result = await client.listModels({ agentId: "work" });
+
+        expect(request).toHaveBeenCalledExactlyOnceWith("models.list", {
+          agentId: "work",
+          ...(published ? { includeDetails: true } : {}),
+        });
+        expect(result).toEqual(
+          published
+            ? models
+            : [
+                { provider: "fixture", id: "waiting", name: "Waiting" },
+                { provider: "fixture", id: "unknown", name: "Unknown" },
+              ],
+        );
+      } finally {
+        request.mockRestore();
+      }
+    },
+  );
 
   it("waits for gateway transport teardown on stop", async () => {
     const client = new GatewayChatClient({
@@ -156,13 +213,16 @@ describe("GatewayChatClient", () => {
 
   it("surfaces loopback block-mode start failures through disconnect handler", async () => {
     vi.useFakeTimers();
+    // The preceding mock test resets modules; keep client and proxy ownership together.
+    const { GatewayChatClient: CurrentGatewayChatClient } = await import("./gateway-chat.js");
     const { startProxy, stopProxy } = await import("../infra/net/proxy/proxy-lifecycle.js");
     const proxyHandle = await startProxy({
       proxyUrl: "http://127.0.0.1:3128",
       loopbackMode: "block",
     });
-    const onDisconnected = vi.fn();
-    const client = new GatewayChatClient({
+    const disconnected = createDeferred<string>();
+    const onDisconnected = vi.fn(disconnected.resolve);
+    const client = new CurrentGatewayChatClient({
       url: "ws://127.0.0.1:18789",
       token: "test-token",
     });
@@ -172,10 +232,13 @@ describe("GatewayChatClient", () => {
       client.start();
       await vi.advanceTimersByTimeAsync(2);
 
-      expect(onDisconnected).toHaveBeenCalledWith(
-        "proxy: Gateway loopback control-plane connections are blocked by proxy.loopbackMode",
-      );
+      const message =
+        "proxy: Gateway loopback control-plane connections are blocked by proxy.loopbackMode; " +
+        "run openclaw config set proxy.loopbackMode gateway-only to allow local runtime traffic.";
+      await expect(disconnected.promise).resolves.toBe(message);
+      expect(onDisconnected).toHaveBeenCalledExactlyOnceWith(message);
     } finally {
+      await client.stop();
       await stopProxy(proxyHandle);
     }
   });

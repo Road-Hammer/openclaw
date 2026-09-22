@@ -91,6 +91,13 @@ function prepareDocsPublisher() {
       output,
     );
   }
+  fs.mkdirSync(path.join(target, "docs"));
+  fs.writeFileSync(path.join(target, "docs", "page.mdx"), "# Valid page\n");
+  fs.symlinkSync(
+    path.join(source, "node_modules"),
+    path.join(target, ".openclaw-sync", "node_modules"),
+    "junction",
+  );
 }
 
 function resolveRef(cwd, ref) {
@@ -315,13 +322,43 @@ async function until(predicate, label, deadline) {
 async function waitForReady(predicate, child, stopped = () => !fs.existsSync(lease)) {
   // Readiness belongs to the owned child's lifetime. The supervisor's existing
   // watchdog bounds startup; an independent short timer can preempt legal Git work.
-  while (!stopped() && child.exitCode === null && child.signalCode === null) {
-    if (predicate()) {
-      return true;
+  return new Promise((resolve, reject) => {
+    const watchers = [];
+    let finished = false;
+    const finish = (ready, error) => {
+      if (finished) return;
+      finished = true;
+      for (const watcher of watchers) watcher.close();
+      child.off("exit", check);
+      child.off("error", fail);
+      if (error) reject(error);
+      else resolve(ready);
+    };
+    const fail = (error) => finish(false, error);
+    const check = () => {
+      if (finished) return;
+      try {
+        if (stopped() || child.exitCode !== null || child.signalCode !== null) finish(false);
+        else if (predicate()) finish(true);
+      } catch (error) {
+        fail(error);
+      }
+    };
+    try {
+      // Install before the first read: registration and atomic readiness renames
+      // can otherwise happen between observing absence and starting the watcher.
+      for (const directory of [root, recordsDir]) {
+        const watcher = fs.watch(directory, check);
+        watchers.push(watcher);
+        watcher.on("error", fail);
+      }
+      child.once("exit", check);
+      child.once("error", fail);
+      check();
+    } catch (error) {
+      fail(error);
     }
-    await delay(10);
-  }
-  return false;
+  });
 }
 
 function launch(role, attempt) {
@@ -372,6 +409,9 @@ function insideOwnedPath(target) {
 
 const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
 const shellPath = (value) => value.replaceAll("\\", "/");
+// GitHub's macOS runners use the system Bash. Homebrew Bash 5.3 can block while
+// writing a workflow policy heredoc before the Python consumer starts.
+const workflowShell = process.platform === "darwin" ? "/bin/bash" : "bash";
 
 function writeConsumer(target, tool) {
   const argv = [process.execPath, fixture, tool, root, policyScenario].map((value) =>
@@ -382,7 +422,10 @@ function writeConsumer(target, tool) {
 
 async function command() {
   holdLease();
-  if (!options.performance || mode !== "observe") await record(process.pid, mode);
+  // Tree actors publish their attempt after installing their signal handler below.
+  if (mode !== "child" && mode !== "grandchild" && (!options.performance || mode !== "observe")) {
+    await record(process.pid, mode);
+  }
   if (mode === "sentinel") {
     return;
   }
@@ -446,7 +489,7 @@ async function command() {
     }
     return;
   }
-  if (["gh", "node", "pnpm", "go", "crabbox"].includes(mode)) {
+  if (["gh", "node", "npm", "pnpm"].includes(mode)) {
     const cwd = insideOwnedPath(process.cwd());
     recordCommand(mode, cwd, args);
     if (options.performance && mode === "node") {
@@ -472,6 +515,20 @@ async function command() {
       process.exit(0);
     }
     await boundary(`consumer:${mode}`);
+    if (mode === "npm" && options.docsPublish) {
+      // Model npm ci's installed-lock output without downloading or modifying
+      // the real dependencies borrowed by the copied checker.
+      fs.mkdirSync(path.join(cwd, "node_modules"), { recursive: true });
+      fs.copyFileSync(
+        path.join(cwd, "package-lock.json"),
+        path.join(cwd, "node_modules", ".package-lock.json"),
+      );
+      process.exit(0);
+    }
+    if (mode === "node" && options.docsPublish && args[0] === ".openclaw-sync/check-docs-mdx.mts") {
+      const result = spawnSync(process.execPath, args, { stdio: "inherit" });
+      process.exit(result.status ?? 1);
+    }
     if (mode === "node" && options.docsPublish && args[0] === "--input-type=module") {
       const validator =
         "import fs from 'node:fs'; " +
@@ -488,31 +545,6 @@ async function command() {
       }
       const result = spawnSync(process.execPath, args, { stdio: "inherit" });
       process.exit(result.status ?? 1);
-    }
-    if (mode === "go") {
-      const [build, changeDirectory, source, outputFlag, output, target] = args;
-      if (
-        build !== "build" ||
-        changeDirectory !== "-C" ||
-        outputFlag !== "-o" ||
-        target !== "./cmd/crabbox" ||
-        args.length !== 6
-      ) {
-        throw new Error("Unexpected fixture Go build arguments");
-      }
-      if (!fs.statSync(path.join(insideOwnedPath(source), ".git")).isDirectory()) {
-        throw new Error("Go build source is not a checkout");
-      }
-      writeConsumer(insideOwnedPath(output), "crabbox");
-    }
-    if (mode === "crabbox") {
-      if (args.join(" ") === "--version") {
-        fs.writeSync(1, "crabbox fixture\n");
-      } else if (args.join(" ") === "warmup --help") {
-        fs.writeSync(1, "-desktop\n");
-      } else if (args.join(" ") !== "media preview --help") {
-        throw new Error("Unexpected fixture Crabbox probe");
-      }
     }
     if (mode === "gh" && options.publisher) {
       const result = spawnSync("bash", [options.publisher.gh, ...args], { stdio: "inherit" });
@@ -624,6 +656,19 @@ async function command() {
       ? JSON.parse(fs.readFileSync(treeCounter, "utf8")) + 1
       : 1;
     await boundary(`${operation}:${resultAttempt}`);
+    if (operation === "rebase" && options.env?.FIXTURE_DOCS_MDX_AFTER_REBASE) {
+      fs.writeFileSync(
+        path.join(cwd, "docs", "page.mdx"),
+        options.env.FIXTURE_DOCS_MDX_AFTER_REBASE,
+      );
+    }
+    if (
+      operation === "rebase" &&
+      resultAttempt === 2 &&
+      options.env?.FIXTURE_DOCS_LOCK_AFTER_REBASE
+    ) {
+      fs.appendFileSync(path.join(cwd, "package-lock.json"), "\n");
+    }
     publish("tree-attempt.json", attempt);
     await record(process.pid, "parent", attempt);
     if (operation === "clone" || operation === "worktree") {
@@ -906,7 +951,7 @@ async function command() {
     operation === "diff" &&
     ((options.docsPublish &&
       args.join(" ") === "--quiet -- docs .openclaw-sync package.json package-lock.json") ||
-      (options.docsAgent && args.join(" ") === "--quiet") ||
+      (options.docsAgent && args.join(" ") === "HEAD --quiet") ||
       options.maturity)
   ) {
     await boundary("diff");
@@ -1007,10 +1052,10 @@ async function supervise() {
   }
   const extraTools = [
     ...(linux ? ["find"] : []),
-    ...(options.docsPublish ? ["rm"] : []),
+    ...(options.docsPublish ? ["rm", "npm"] : []),
     ...(options.performance ? ["curl", "tar", "sha256sum", "npm"] : []),
     ...(options.docsAgent ? ["date"] : []),
-    ...(options.consumers ? ["gh", "node", "pnpm", "go"] : []),
+    ...(options.consumers ? ["gh", "node", "pnpm"] : []),
   ];
   for (const tool of extraTools) {
     writeConsumer(path.join(bin, tool), tool);
@@ -1272,13 +1317,15 @@ async function supervise() {
       process.platform === "win32"
         ? [
             "-c",
-            'export PATH="$(cygpath -u "$1"):$PATH"; source "$2"',
+            'export PATH="$(cygpath -u "$1"):$PATH"; export TEMP="$3" TMP="$4"; source "$2"',
             "checkout-fixture",
             bin,
             checkoutScript,
+            options.env?.TEMP ?? root,
+            options.env?.TMP ?? root,
           ]
         : [checkoutScript];
-    shell = spawn("bash", ["--noprofile", "--norc", "-eo", "pipefail", ...shellArgs], {
+    shell = spawn(workflowShell, ["--noprofile", "--norc", "-eo", "pipefail", ...shellArgs], {
       cwd: path.join(workspace, options.workingDirectory ?? ""),
       detached: true,
       stdio: ["ignore", output, output],
@@ -1302,6 +1349,12 @@ async function supervise() {
         CHECKOUT_BASE_SHA: linux && scenario === "early-leader-exit" ? "c".repeat(40) : "",
         WORKFLOW_SHA: "b".repeat(40),
         ...options.env,
+        // MSYS shares its first /tmp mount across overlapping Bash processes.
+        // Bootstrap it from the retained artifact parent, then restore private
+        // TEMP/TMP in Bash before any checkout actor starts.
+        ...(process.platform === "win32"
+          ? { TEMP: path.dirname(root), TMP: path.dirname(root) }
+          : {}),
       },
     });
     const closed = track(shell);

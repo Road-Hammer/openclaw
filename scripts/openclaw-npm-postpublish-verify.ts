@@ -1,7 +1,7 @@
 #!/usr/bin/env -S node --import tsx
 // Openclaw Npm Postpublish Verify script supports OpenClaw repository automation.
 
-import { createHash, createPublicKey, verify as verifySignature } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -17,6 +17,12 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join, posix as pathPosix, relative, win32 as pathWin32 } from "node:path";
 import { pathToFileURL } from "node:url";
 import { expectDefined } from "../packages/normalization-core/src/expect.js";
+import { collectPackageRootImports } from "../src/infra/package-root-imports.js";
+import {
+  readRuntimeDependencyOwnership,
+  RUNTIME_DEPENDENCY_OWNERSHIP_RELATIVE_PATH,
+  type RuntimeDependencyOwnership,
+} from "../src/infra/runtime-dependency-ownership.js";
 import { ALWAYS_ALLOWED_RUNTIME_DIR_NAMES } from "../src/plugin-sdk/facade-activation-contract.ts";
 import { BUNDLED_RUNTIME_SIDECAR_PATHS } from "../src/plugins/runtime-sidecar-paths.ts";
 import {
@@ -26,22 +32,17 @@ import {
 import { readBoundedResponseText } from "./lib/bounded-response.mjs";
 import { listBundledPluginPackArtifacts } from "./lib/bundled-plugin-build-entries.mjs";
 import { formatErrorMessage } from "./lib/error-format.mts";
+import { verifyNpmRegistrySignatures } from "./lib/npm-registry-signatures.mjs";
 import { runNpmVerifyCommand } from "./lib/npm-verify-exec.ts";
 import {
   comparePackageDistInventory,
   PACKAGE_DIST_INVENTORY_RELATIVE_PATH,
 } from "./lib/package-dist-inventory-contract.mts";
-import { collectPackageRootImports } from "./lib/package-root-imports.ts";
 import {
   collectRuntimeDependencySpecs,
   packageNameFromSpecifier,
 } from "./lib/plugin-package-dependencies.mts";
 import { classifyReleaseTrain } from "./lib/release-version.mjs";
-import {
-  readRuntimeDependencyOwnership,
-  RUNTIME_DEPENDENCY_OWNERSHIP_RELATIVE_PATH,
-  type RuntimeDependencyOwnership,
-} from "./lib/runtime-dependency-ownership-contract.mts";
 import { runInstalledWorkspaceBootstrapSmoke } from "./lib/workspace-bootstrap-smoke.mts";
 import { parseReleaseVersion, resolveNpmCommandInvocation } from "./openclaw-npm-release-check.ts";
 import { buildCmdExeCommandLine, resolveWindowsCmdExePath } from "./windows-cmd-helpers.mjs";
@@ -155,7 +156,7 @@ export function parseOpenClawNpmPostpublishVerifyArgs(
     throw new Error(`Unknown openclaw npm postpublish verifier option: ${version}`);
   }
   const extraArg = args[1]?.trim();
-  if (extraArg) {
+  if (args.length > 1) {
     throw new Error(`Unexpected openclaw npm postpublish verifier argument: ${extraArg}`);
   }
   return { help: false, version };
@@ -260,50 +261,6 @@ type FetchRegistryJsonOptions = {
   maxBodyBytes?: number;
   timeoutMs?: number;
 };
-
-export function verifyNpmRegistrySignatures(params: {
-  integrity: string;
-  keys: NpmRegistryKey[];
-  packageName: string;
-  signatures: NpmRegistrySignature[];
-  version: string;
-}): void {
-  if (!params.integrity.startsWith("sha512-")) {
-    throw new Error(`npm registry integrity is missing a sha512 digest for ${params.packageName}.`);
-  }
-  if (params.signatures.length === 0) {
-    throw new Error(
-      `npm registry returned no signatures for ${params.packageName}@${params.version}.`,
-    );
-  }
-
-  const payload = `${params.packageName}@${params.version}:${params.integrity}`;
-  for (const signature of params.signatures) {
-    const key = params.keys.find((candidate) => candidate.keyid === signature.keyid);
-    if (!key) {
-      continue;
-    }
-    const publicKey = createPublicKey({
-      key: Buffer.from(key.key, "base64"),
-      format: "der",
-      type: "spki",
-    });
-    if (
-      verifySignature(
-        "sha256",
-        Buffer.from(payload, "utf8"),
-        publicKey,
-        Buffer.from(signature.sig, "base64"),
-      )
-    ) {
-      return;
-    }
-  }
-
-  throw new Error(
-    `npm registry signatures did not verify for ${params.packageName}@${params.version}.`,
-  );
-}
 
 function resolveNpmProvenanceVerificationPolicy(
   statement: NpmProvenanceStatement,
